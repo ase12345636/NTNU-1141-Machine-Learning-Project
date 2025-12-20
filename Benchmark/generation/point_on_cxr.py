@@ -8,9 +8,18 @@ from tqdm import tqdm
 from PIL import Image
 from pathlib import Path
 from scipy import ndimage
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for multiprocessing
 import matplotlib.pyplot as plt
 from adjustText import adjust_text
 from detectron2.utils.visualizer import ColorMode, Visualizer
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import torch
+
+# CUDA support
+CUDA_AVAILABLE = torch.cuda.is_available()
+DEVICE = "cuda" if CUDA_AVAILABLE else "cpu"
 
 def config():
     parser = argparse.ArgumentParser()
@@ -26,6 +35,9 @@ def config():
     parser.add_argument('--nih_image_base_dir', type=str, default='/mnt/d/CXReasonBench/dataset', help='Path to NIH images folders (images_001, images_002, ...)')
 
     parser.add_argument('--cxas_base_dir', type=str, default='path/to/cxas_segmentation_folders')
+    
+    # 多進程參數
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of parallel workers (default: 4, set to 1 to disable)')
 
     args = parser.parse_args()
     return args
@@ -734,6 +746,26 @@ pnt_fn_per_dx = {
     'descending_aorta_tortuous': pnt_desc_aorta_tortuous,
 }
 
+def check_if_processed(dicom, save_dir):
+    """檢查影像是否已經處理過"""
+    output_path = os.path.join(save_dir, f'{dicom}.png')
+    return os.path.exists(output_path)
+
+def process_single_pnt_image(args_tuple):
+    """處理單個影像的包裝函數，用於多進程處理"""
+    dicom, dx, save_dir, viz_df, args = args_tuple
+    
+    # 檢查是否已經處理過
+    if check_if_processed(dicom, save_dir):
+        return {'dicom': dicom, 'status': 'skipped', 'error': None}
+    
+    try:
+        target_df = viz_df[viz_df['image_file'] == dicom]
+        pnt_fn_per_dx[dx](args, dicom, target_df, save_dir)
+        return {'dicom': dicom, 'status': 'success', 'error': None}
+    except Exception as e:
+        return {'dicom': dicom, 'status': 'error', 'error': str(e)}
+
 
 if __name__ == "__main__":
     args = config()
@@ -747,6 +779,20 @@ if __name__ == "__main__":
     args.saved_dir_viz = os.path.join(args.saved_base_dir, f"{args.dataset_name}_viz")
     saved_path_viz_list = glob(os.path.join(args.saved_dir_viz, '*.csv'))
     
+    # 顯示處理設定
+    print(f"\n{'='*60}")
+    print(f"Point-on-CXR 處理設定:")
+    print(f"  資料集: {args.dataset_name}")
+    print(f"  併行 worker 數: {args.num_workers}")
+    if args.num_workers > 1:
+        print(f"  模式: 多進程並行處理 (速度提升 {args.num_workers}x)")
+    else:
+        print(f"  模式: 單進程順序處理")
+    print(f"  CUDA 加速: {'✓ 可用 (GPU)' if CUDA_AVAILABLE else '✗ 不可用 (CPU)'}")
+    if CUDA_AVAILABLE:
+        print(f"  GPU 設備: {torch.cuda.get_device_name(0)}")
+    print(f"{'='*60}\n")
+    
     for saved_path_viz in saved_path_viz_list:
         dx = Path(saved_path_viz).stem
         if dx in pnt_fn_per_dx:
@@ -755,6 +801,66 @@ if __name__ == "__main__":
 
             viz_df = pd.read_csv(saved_path_viz)
             dicom_list = viz_df['image_file'].tolist()
-            for dicom in tqdm(dicom_list, total=len(dicom_list)):
-                target_df = viz_df[viz_df['image_file'] == dicom]
-                pnt_fn_per_dx[dx](args, dicom, target_df, save_dir)
+            
+            # 統計已完成的輸出檔案數量
+            completed_count = 0
+            if os.path.exists(save_dir):
+                completed_count = len([f for f in os.listdir(save_dir) if f.endswith('.png')])
+            
+            completion_rate = (completed_count / len(dicom_list) * 100) if len(dicom_list) > 0 else 0
+            
+            print(f"\n{'='*60}")
+            print(f"診斷任務: {dx}")
+            print(f"  總影像數: {len(dicom_list)}")
+            print(f"  已完成: {completed_count} ({completion_rate:.1f}%)")
+            
+            # 如果完成率超過 80%，詢問是否跳過
+            if completion_rate > 80:
+                print(f"  ⚠️  此任務已接近完成，是否跳過？")
+                user_input = input(f"  跳過 {dx}? (y/n，直接Enter視為n): ").strip().lower()
+                if user_input == 'y':
+                    print(f"  ✓ 跳過 {dx}")
+                    continue
+            print(f"{'='*60}")
+            
+            if args.num_workers > 1:
+                # 多進程處理
+                task_args = [(dicom, dx, save_dir, viz_df, args) for dicom in dicom_list]
+                
+                with Pool(processes=args.num_workers) as pool:
+                    results = list(tqdm(
+                        pool.imap(process_single_pnt_image, task_args),
+                        total=len(task_args),
+                        desc=f'{dx}'
+                    ))
+                
+                processed_count = sum(1 for r in results if r['status'] == 'success')
+                skipped_count = sum(1 for r in results if r['status'] == 'skipped')
+                error_count = sum(1 for r in results if r['status'] == 'error')
+                
+                if error_count > 0:
+                    print(f"\n⚠️  有 {error_count} 個影像處理失敗")
+                    for r in results:
+                        if r['status'] == 'error':
+                            print(f"  - {r['dicom']}: {r['error']}")
+            else:
+                # 單進程處理
+                processed_count = 0
+                skipped_count = 0
+                error_count = 0
+                
+                for dicom in tqdm(dicom_list, total=len(dicom_list), desc=f'{dx}'):
+                    if check_if_processed(dicom, save_dir):
+                        skipped_count += 1
+                        continue
+                    
+                    try:
+                        target_df = viz_df[viz_df['image_file'] == dicom]
+                        pnt_fn_per_dx[dx](args, dicom, target_df, save_dir)
+                        processed_count += 1
+                    except Exception as e:
+                        print(f"\nError processing {dicom}: {e}")
+                        error_count += 1
+                        continue
+            
+            print(f"✅ {dx} 完成 - 新處理: {processed_count}, 跳過: {skipped_count}, 錯誤: {error_count}")

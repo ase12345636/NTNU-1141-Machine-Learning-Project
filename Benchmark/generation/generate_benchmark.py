@@ -1799,7 +1799,21 @@ if __name__ == '__main__':
 
     args.segmask_base_dir = os.path.join(args.cxreasonbench_base_dir, 'segmask_bodypart')
     args.pnt_base_dir = os.path.join(args.cxreasonbench_base_dir, 'pnt_on_cxr')
-    args.dx_by_dicoms_file = os.path.join(args.cxreasonbench_base_dir, 'dx_by_dicoms.json')
+    
+    # Choose appropriate dx_by_dicoms file based on inference path
+    if args.inference_path in ['path2']:
+        # Path 2 requires valid viz data
+        dx_by_dicoms_file_path2 = os.path.join(args.cxreasonbench_base_dir, 'dx_by_dicoms_path2.json')
+        if os.path.exists(dx_by_dicoms_file_path2):
+            args.dx_by_dicoms_file = dx_by_dicoms_file_path2
+            print(f"Using Path 2 image list (only images with valid viz data)")
+        else:
+            print(f"Warning: {dx_by_dicoms_file_path2} not found, using all images")
+            args.dx_by_dicoms_file = os.path.join(args.cxreasonbench_base_dir, 'dx_by_dicoms.json')
+    else:
+        # Path 1 and re-path1 can use all images
+        args.dx_by_dicoms_file = os.path.join(args.cxreasonbench_base_dir, 'dx_by_dicoms.json')
+        print(f"Using Path 1 image list (all images)")
 
     # Load metadata based on dataset type
     if args.dataset_name == 'mimic-cxr-jpg':

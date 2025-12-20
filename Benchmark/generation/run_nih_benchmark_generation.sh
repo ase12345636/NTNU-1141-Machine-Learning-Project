@@ -150,8 +150,8 @@ echo ""
 # 步驟 2: 創建可視化 CSV 檔案
 # =============================================================================
 
-print_header "步驟 2/6: 創建可視化 CSV 檔案"
-print_step "生成每個診斷任務需要可視化的影像列表..."
+print_header "步驟 2/6: 創建可視化 CSV 檔案 (從CXAS計算viz欄位)"
+print_step "生成每個診斷任務需要可視化的影像列表，並從CXAS masks計算viz欄位..."
 
 VIZ_DIR="${BASE_DIR}/nih-cxr14_viz"
 
@@ -162,11 +162,29 @@ else
     python create_viz_csvs_nih.py \
         --dx_by_dicoms_file "${DX_BY_DICOMS_FILE}" \
         --output_dir "${VIZ_DIR}" \
-        --nih_csv_dir "${CHEXSTRUCT_DIR}"
+        --nih_csv_dir "${CHEXSTRUCT_DIR}" \
+        --cxas_dir "${CXAS_DIR}"
     
     if [ $? -eq 0 ]; then
-        print_success "可視化CSV檔案創建成功"
+        print_success "可視化CSV檔案創建成功（包含從CXAS計算的viz欄位）"
         echo "位置: ${VIZ_DIR}"
+        
+        # Create separate dx_by_dicoms for Path 2 (only images with valid viz data)
+        print_step "創建 dx_by_dicoms_path2.json (僅包含viz數據完整的圖像)..."
+        DX_BY_DICOMS_PATH2="${OUTPUT_DIR}/dx_by_dicoms_path2.json"
+        python update_dx_by_dicoms_from_viz.py \
+            --viz_dir "${VIZ_DIR}" \
+            --dx_by_dicoms_file "${DX_BY_DICOMS_FILE}" \
+            --output_path2_file "${DX_BY_DICOMS_PATH2}"
+        
+        if [ $? -eq 0 ]; then
+            print_success "dx_by_dicoms_path2.json 已創建"
+            echo "  Path 1 (reasoning): 使用所有圖像 (${DX_BY_DICOMS_FILE})"
+            echo "  Path 2 (guidance):  僅使用viz完整圖像 (${DX_BY_DICOMS_PATH2})"
+        else
+            print_error "創建 dx_by_dicoms_path2.json 失敗"
+            exit 1
+        fi
     else
         print_error "可視化CSV檔案創建失敗"
         exit 1
@@ -185,6 +203,10 @@ print_warning "這一步需要 detectron2，可能需要較長時間..."
 
 SEGMASK_DIR="${OUTPUT_DIR}/segmask_bodypart"
 
+# 設定並行處理的worker數量 (根據CPU核心數調整)
+NUM_WORKERS=6
+print_step "使用 ${NUM_WORKERS} 個並行worker加速處理"
+
 # 檢查是否已有部分輸出
 EXISTING_SEGMASKS=$(find "${SEGMASK_DIR}" -type f -name "*.png" 2>/dev/null | wc -l)
 if [ ${EXISTING_SEGMASKS} -gt 100 ]; then
@@ -199,7 +221,8 @@ if [ ${EXISTING_SEGMASKS} -gt 100 ]; then
             --saved_base_dir "${BASE_DIR}" \
             --save_base_dir "${OUTPUT_DIR}" \
             --nih_image_base_dir "${IMAGE_DIR}" \
-            --cxas_base_dir "${CXAS_DIR}"
+            --cxas_base_dir "${CXAS_DIR}" \
+            --num_workers ${NUM_WORKERS}
         
         if [ $? -eq 0 ]; then
             print_success "分割遮罩可視化生成成功"
@@ -215,7 +238,8 @@ else
         --saved_base_dir "${BASE_DIR}" \
         --save_base_dir "${OUTPUT_DIR}" \
         --nih_image_base_dir "${IMAGE_DIR}" \
-        --cxas_base_dir "${CXAS_DIR}"
+        --cxas_base_dir "${CXAS_DIR}" \
+        --num_workers ${NUM_WORKERS}
     
     if [ $? -eq 0 ]; then
         print_success "分割遮罩可視化生成成功"
@@ -238,6 +262,8 @@ print_warning "這一步也需要 detectron2..."
 
 PNT_DIR="${OUTPUT_DIR}/pnt_on_cxr"
 
+print_step "使用 ${NUM_WORKERS} 個並行worker加速處理"
+
 # 檢查是否已有部分輸出
 EXISTING_PNTS=$(find "${PNT_DIR}" -type f -name "*.png" 2>/dev/null | wc -l)
 if [ ${EXISTING_PNTS} -gt 100 ]; then
@@ -252,7 +278,8 @@ if [ ${EXISTING_PNTS} -gt 100 ]; then
             --saved_base_dir "${BASE_DIR}" \
             --save_base_dir "${OUTPUT_DIR}" \
             --nih_image_base_dir "${IMAGE_DIR}" \
-            --cxas_base_dir "${CXAS_DIR}"
+            --cxas_base_dir "${CXAS_DIR}" \
+            --num_workers ${NUM_WORKERS}
         
         if [ $? -eq 0 ]; then
             print_success "地標點可視化生成成功"
@@ -267,7 +294,8 @@ else
         --saved_base_dir "${BASE_DIR}" \
         --save_base_dir "${OUTPUT_DIR}" \
         --nih_image_base_dir "${IMAGE_DIR}" \
-        --cxas_base_dir "${CXAS_DIR}"
+        --cxas_base_dir "${CXAS_DIR}" \
+        --num_workers ${NUM_WORKERS}
     
     if [ $? -eq 0 ]; then
         print_success "地標點可視化生成成功"
