@@ -13,10 +13,15 @@ def set_seed(seed):
 
 
 def set_gcp_env(args):
-    os.environ["GOOGLE_CLOUD_LOCATION"] = args.GOOGLE_CLOUD_LOCATION
-    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = args.GOOGLE_GENAI_USE_VERTEXAI
-    os.environ["TOKENIZERS_PARALLELISM"] = args.TOKENIZERS_PARALLELISM
-    os.environ["GOOGLE_CLOUD_PROJECT"] = args.GOOGLE_CLOUD_PROJECT
+    # Only set environment variables when values are provided (avoid None)
+    if getattr(args, 'GOOGLE_CLOUD_LOCATION', None) is not None:
+        os.environ["GOOGLE_CLOUD_LOCATION"] = str(args.GOOGLE_CLOUD_LOCATION)
+    if getattr(args, 'GOOGLE_GENAI_USE_VERTEXAI', None) is not None:
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = str(args.GOOGLE_GENAI_USE_VERTEXAI)
+    if getattr(args, 'TOKENIZERS_PARALLELISM', None) is not None:
+        os.environ["TOKENIZERS_PARALLELISM"] = str(args.TOKENIZERS_PARALLELISM)
+    if getattr(args, 'GOOGLE_CLOUD_PROJECT', None) is not None:
+        os.environ["GOOGLE_CLOUD_PROJECT"] = str(args.GOOGLE_CLOUD_PROJECT)
 
 
 dx_task_measurement = ['rotation', 'projection', 'cardiomegaly',

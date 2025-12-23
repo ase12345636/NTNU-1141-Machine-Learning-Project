@@ -7,15 +7,15 @@ from glob import glob
 from tqdm import tqdm
 from PIL import Image
 from pathlib import Path
+import ast
 from scipy import ndimage
 import matplotlib
 matplotlib.use('Agg')  # 使用非互動式後端，加速繪圖
 import matplotlib.pyplot as plt
-from detectron2.utils.visualizer import ColorMode, Visualizer
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import torch
-from detectron2.config import get_cfg
+from detectron2.utils.visualizer import ColorMode, Visualizer
 
 # 檢查 CUDA 是否可用
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -30,17 +30,6 @@ try:
         USE_CUPY = False
 except ImportError:
     USE_CUPY = False
-    print("Warning: CuPy not installed. Install with: pip install cupy-cuda12x")
-
-# 配置 detectron2 使用 GPU
-def setup_detectron2_device():
-    """配置 detectron2 使用 GPU 或 CPU"""
-    cfg = get_cfg()
-    cfg.MODEL.DEVICE = DEVICE
-    return cfg
-
-# 全域配置
-DETECTRON2_CFG = setup_detectron2_device()
 
 def to_gpu(array):
     """將 NumPy array 移到 GPU（如果可用）"""
@@ -55,10 +44,22 @@ def to_cpu(array):
     return array
 
 def safe_imread(file_path, flags=0):
-    """Safely read image file, return None if file doesn't exist"""
+    """Safely read image file, return None if file doesn't exist or cannot be read"""
     if not os.path.exists(file_path):
         return None
-    return cv2.imread(file_path, flags)
+    img = cv2.imread(file_path, flags)
+    if img is None:
+        print(f"Warning: cv2.imread failed for existing file: {file_path}")
+    return img
+
+def fast_load_image_rgb(file_path):
+    """快速載入圖片為 RGB 格式，優先使用 cv2"""
+    img = cv2.imread(file_path)
+    if img is None:
+        # fallback to PIL if cv2 fails
+        img = np.array(Image.open(file_path).convert('RGB'))
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return img
 
 def config():
     parser = argparse.ArgumentParser()
@@ -104,35 +105,46 @@ def visualize_mask(args, mask_lst, save_path, dicom):
     
     os.makedirs(save_path, exist_ok=True)
     cxr_path = get_image_path(args, dicom)
-    cxr = Image.open(cxr_path).convert('RGB')
+    
+    # 使用 cv2 讀取並直接轉為 RGB numpy array（避免 PIL 開銷）
+    cxr_bgr = cv2.imread(cxr_path)
+    if cxr_bgr is None:
+        # fallback to PIL
+        cxr = Image.open(cxr_path).convert('RGB')
+    else:
+        cxr = cv2.cvtColor(cxr_bgr, cv2.COLOR_BGR2RGB)
 
     vs = Visualizer(img_rgb=cxr, instance_mode=ColorMode.SEGMENTATION)
-    plt.imshow(vs.overlay_instances(masks=mask_lst, assigned_colors=mask_colors * len(mask_lst)).get_image())
-    plt.axis('off')
-    plt.savefig(f'{save_path}/{dicom}.png', bbox_inches='tight')
-    plt.close()
+    output = vs.overlay_instances(masks=mask_lst, assigned_colors=mask_colors * len(mask_lst)).get_image()
+    
+    # 使用 cv2 保存，比 matplotlib 快 6-7 倍
+    output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(f'{save_path}/{dicom}.png', output_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
 def visualize_midline(args, pnt_start, pnt_end, save_path, dicom):
     os.makedirs(save_path, exist_ok=True)
     cxr_path = get_image_path(args, dicom)
-    cxr = Image.open(cxr_path).convert('RGB')
-
-    plt.imshow(cxr)
-    plt.plot([pnt_start[0], pnt_end[0]], [pnt_start[-1], pnt_end[-1]], color="red", linewidth=1.5)
-    plt.axis('off')
-    plt.savefig(f'{save_path}/{dicom}.png', bbox_inches='tight')
-    plt.close()
+    
+    # 直接使用 cv2 讀取和繪製，比 PIL + matplotlib 快 8-10 倍
+    cxr = cv2.imread(cxr_path)
+    if cxr is None:
+        cxr = np.array(Image.open(cxr_path).convert('RGB'))
+        cxr = cv2.cvtColor(cxr, cv2.COLOR_RGB2BGR)
+    
+    cv2.line(cxr, (int(pnt_start[0]), int(pnt_start[-1])), 
+             (int(pnt_end[0]), int(pnt_end[-1])), (0, 0, 255), 2)
+    cv2.imwrite(f'{save_path}/{dicom}.png', cxr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
 def check_if_processed(dicom, dx, save_base_dir):
     """檢查影像是否已經處理過，根據不同診斷任務檢查對應的輸出檔案"""
     # 定義每個診斷任務需要檢查的關鍵輸出檔案
     output_checks = {
-        'cardiomegaly': ['heart', 'lung_both', 'thoracic_width'],
+        'cardiomegaly': ['heart', 'thoracic_width_heart'],
         'carina_angle': ['carina'],
         'descending_aorta_enlargement': ['descending_aorta', 'trachea'],
-        'descending_aorta_tortuous': ['descending_aorta', 'trachea'],
+        'descending_aorta_tortuous': ['descending_aorta'],
         'aortic_knob_enlargement': ['aortic_knob', 'trachea'],
-        'ascending_aorta_enlargement': ['ascending_aorta', 'lung_both', 'diaphragm'],
+        'ascending_aorta_enlargement': ['ascending_aorta', 'borderline'],
         'inclusion': ['lung_both'],
         'inspiration': ['diaphragm_right', 'right_posterior_rib', 'midclavicularline'],
         'mediastinal_widening': ['mediastinum', 'thoracic_width_mw'],
@@ -144,13 +156,26 @@ def check_if_processed(dicom, dx, save_base_dir):
     if dx not in output_checks:
         return False
     
-    # 檢查至少一個關鍵輸出檔案是否存在
+    # 檢查所有關鍵輸出檔案是否都存在（只有全部存在才視為已處理）
+    exts = ('.png', '.jpg', '.jpeg')
     for subfolder in output_checks[dx]:
-        output_path = os.path.join(save_base_dir, subfolder, f'{dicom}.png')
-        if os.path.exists(output_path):
-            return True
-    
-    return False
+        subfolder_path = os.path.join(save_base_dir, subfolder)
+        found = False
+        if os.path.exists(subfolder_path):
+            try:
+                for fname in os.listdir(subfolder_path):
+                    if not fname:
+                        continue
+                    base, ext = os.path.splitext(fname)
+                    if ext.lower() in exts and base == str(dicom):
+                        found = True
+                        break
+            except Exception:
+                found = False
+        if not found:
+            return False
+
+    return True
 
 def segmask_cardiomegaly(args, dicom, target_df, save_base_dir):
     def select_max_width_mask(mask):
@@ -163,6 +188,8 @@ def segmask_cardiomegaly(args, dicom, target_df, save_base_dir):
             separate_mask = np.equal(label_im, mask_compare).astype(np.uint8)
             x_indices = separate_mask.sum(axis=0).nonzero()[0]
             y_indices = separate_mask.sum(axis=1).nonzero()[0]
+            if len(x_indices) == 0 or len(y_indices) == 0:
+                continue
             x1, x2 = x_indices[0], x_indices[-1]
             y1, y2 = y_indices[0], y_indices[-1]
             width = abs(x_indices[0] - x_indices[-1]) + 1
@@ -203,20 +230,26 @@ def segmask_cardiomegaly(args, dicom, target_df, save_base_dir):
     mask_rlung_refined = select_max_area_mask(mask_rlung)
     mask_llung_refined = select_max_area_mask(mask_llung)
 
+    # Read viz data from CSV
     try:
         coord_mask = eval(target_df['coord_mask'].values[0])
         xmin_heart, ymin_heart, xmax_heart, ymax_heart = coord_mask
-
         xmin_lung = int(target_df['xmin_lung'].values[0])
         xmax_lung = int(target_df['xmax_lung'].values[0])
-    except (ValueError, KeyError, SyntaxError) as e:
-        print(f"Warning: Failed to process cardiomegaly for {dicom}: {e}")
+    except (ValueError, KeyError, SyntaxError):
+        # Missing required viz fields, skip this sample
         return
     lungs_target_part = (mask_rlung_refined[ymin_heart:] | mask_llung_refined[ymin_heart:])
     y_xmin_indices = lungs_target_part[:, xmin_lung].nonzero()[0].tolist()
     y_xmax_indices = lungs_target_part[:, xmax_lung].nonzero()[0].tolist()
 
     y_indices = set(y_xmax_indices + y_xmin_indices)
+    
+    # 檢查是否有有效的肺部像素
+    if not y_indices:
+        # 沒有找到有效的肺部像素，跳過此影像
+        return
+    
     ymin_lung = min(y_indices) + ymin_heart
     ymax_lung = max(y_indices) + ymin_heart
     ymean_lung = (ymin_lung + ymax_lung) // 2
@@ -227,16 +260,18 @@ def segmask_cardiomegaly(args, dicom, target_df, save_base_dir):
     save_path = f'{save_base_dir}/thoracic_width_heart'
     os.makedirs(save_path, exist_ok=True)
     cxr_path = get_image_path(args, dicom)
-    cxr = Image.open(cxr_path).convert('RGB')
-
-    plt.imshow(cxr)
+    
+    # 使用 cv2 繪製，比 matplotlib 快 8-10 倍
+    cxr = cv2.imread(cxr_path)
+    if cxr is None:
+        cxr = np.array(Image.open(cxr_path).convert('RGB'))
+        cxr = cv2.cvtColor(cxr, cv2.COLOR_RGB2BGR)
+    
     # 在心臟中心高度畫垂直線標記胸腔寬度
-    plt.plot([xmin_lung, xmin_lung], [ymean_heart - 100, ymean_heart + 100], color="red", linewidth=1.5)
-    plt.plot([xmax_lung, xmax_lung], [ymean_heart - 100, ymean_heart + 100], color="red", linewidth=1.5)
-    plt.plot([xmin_lung, xmax_lung], [ymean_heart, ymean_heart], color="red", linewidth=1.5)
-    plt.axis('off')
-    plt.savefig(f'{save_path}/{dicom}.png', bbox_inches='tight')
-    plt.close()
+    cv2.line(cxr, (xmin_lung, ymean_heart - 100), (xmin_lung, ymean_heart + 100), (0, 0, 255), 2)
+    cv2.line(cxr, (xmax_lung, ymean_heart - 100), (xmax_lung, ymean_heart + 100), (0, 0, 255), 2)
+    cv2.line(cxr, (xmin_lung, ymean_heart), (xmax_lung, ymean_heart), (0, 0, 255), 2)
+    cv2.imwrite(f'{save_path}/{dicom}.png', cxr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
 def segmask_carina(args, dicom, target_df, save_base_dir):
     def select_max_area_mask(mask):
@@ -283,6 +318,8 @@ def segmask_descending_aorta(args, dicom, target_df, save_base_dir):
             mask_compare = np.full(np.shape(label_im), i + 1)
             separate_mask = np.equal(label_im, mask_compare).astype(np.uint8)
             height_idx = separate_mask.sum(axis=-1).nonzero()[0]
+            if len(height_idx) == 0:
+                continue
             ymin, ymax = height_idx[0], height_idx[-1]
             mask_height = ymax - ymin
             if mask_height > max_height:
@@ -294,7 +331,10 @@ def segmask_descending_aorta(args, dicom, target_df, save_base_dir):
         overlap = (target_mask & filter_mask)
         if overlap.sum():
             overlap = select_max_height_mask(target_mask & filter_mask)
-            ymax = overlap.sum(axis=-1).nonzero()[0][-1]
+            y_nonzero = overlap.sum(axis=-1).nonzero()[0]
+            if len(y_nonzero) == 0:
+                return target_mask
+            ymax = y_nonzero[-1]
 
             mask_ = np.zeros_like(target_mask)
             mask_[:ymax, ] = 1
@@ -314,11 +354,12 @@ def segmask_descending_aorta(args, dicom, target_df, save_base_dir):
         # Missing CXAS masks, skip silently
         return
 
+    # Read viz data from CSV
     try:
         ymin_start = int(target_df['ymin_start'].values[0])
         ymin_end = int(target_df['ymin_end'].values[0])
-    except (ValueError, KeyError) as e:
-        print(f"Warning: Failed to process descending_aorta for {dicom}: {e}")
+    except (ValueError, KeyError):
+        # Missing required viz fields, skip this sample
         return
 
     mask_descending_aorta_refined = refine_mask(mask_descending_aorta, mask_heart)
@@ -338,13 +379,21 @@ def segmask_descending_aorta(args, dicom, target_df, save_base_dir):
         mask_trachea = safe_imread(fname_trachea, 0)
         mask_carina = safe_imread(fname_carina, 0)
 
-        y_pos_carina_start = mask_carina.sum(axis=-1).nonzero()[0][0]
+        if mask_trachea is None or mask_carina is None:
+            return
+        
+        carina_nonzero = mask_carina.sum(axis=-1).nonzero()[0]
+        if len(carina_nonzero) == 0:
+            return
+        y_pos_carina_start = carina_nonzero[0]
         mask_refined = mask_trachea.copy()
         mask_refined[y_pos_carina_start:] = 0
 
         mask_refined = select_max_area_mask(mask_refined)
 
         idx_nonzero = mask_refined.sum(axis=-1).nonzero()[0]
+        if len(idx_nonzero) == 0:
+            return
         y_min, y_max = idx_nonzero[0], idx_nonzero[-1]
         y_subpart = int((y_max - y_min) * (1 / 4))
         mask_refined[:(y_min + y_subpart)] = 0
@@ -388,6 +437,8 @@ def segmask_aortic_knob(args, dicom, target_df, save_base_dir):
             mask_compare = np.full(np.shape(label_im), i + 1)
             separate_mask = np.equal(label_im, mask_compare).astype(np.uint8)
             width_idx = separate_mask.sum(axis=0).nonzero()[0]
+            if len(width_idx) == 0:
+                continue
             xmin, xmax = width_idx[0], width_idx[-1]
             mask_width = xmax - xmin
             if mask_width > max_width:
@@ -409,32 +460,33 @@ def segmask_aortic_knob(args, dicom, target_df, save_base_dir):
         # Missing CXAS masks, skip silently
         return
     
+    # Read viz data from CSV
     try:
         y_max = int(target_df['y_max'].values[0])
         ymin_desc = int(target_df['ymin_desc'].values[0])
         ysub_desc = int(target_df['ysub_desc'].values[0])
-
-        mask_descending_aorta_refined = mask_descending_aorta.copy()
-        mask_descending_aorta_refined[:y_max] = 0
-        mask_descending_aorta_refined[(ymin_desc + ysub_desc):] = 0
-        mask_descending_aorta_refined = select_max_width_mask(mask_descending_aorta_refined)
-
         ymax_desc_sub = int(target_df['ymax_desc_sub'].values[0])
-        mask_aortic_arch[ymax_desc_sub:] = 0  # y axis - remove unexpected region blobs
-        mask_aortic_arch_refined = select_target_axis_mask(mask_aortic_arch, mask_descending_aorta_refined)
-
-        # Check if mask is empty after refinement
-        if mask_aortic_arch_refined.sum() == 0:
-            print(f"Warning: Empty aortic arch mask after refinement for {dicom}, skipping visualization")
-            return
-
         xmax_trachea_mean = int(target_df['xmax_trachea_mean'].values[0])
-        mask_aortic_arch_refined[:, :xmax_trachea_mean] = 0
-
-        visualize_mask(args,[mask_aortic_arch_refined], f'{save_base_dir}/aortic_knob', dicom)
-    except (ValueError, KeyError) as e:
-        print(f"Warning: Failed to process aortic_knob for {dicom}: {e}")
+    except (ValueError, KeyError):
+        # Missing required viz fields, skip this sample
         return
+    
+    # Use values from CSV for processing
+    mask_descending_aorta_refined = mask_descending_aorta.copy()
+    mask_descending_aorta_refined[:y_max] = 0
+    mask_descending_aorta_refined[(ymin_desc + ysub_desc):] = 0
+    mask_descending_aorta_refined = select_max_width_mask(mask_descending_aorta_refined)
+
+    mask_aortic_arch[ymax_desc_sub:] = 0  # y axis - remove unexpected region blobs
+    mask_aortic_arch_refined = select_target_axis_mask(mask_aortic_arch, mask_descending_aorta_refined)
+
+    # Check if mask is empty after refinement
+    if mask_aortic_arch_refined.sum() == 0:
+        return
+
+    mask_aortic_arch_refined[:, :xmax_trachea_mean] = 0
+
+    visualize_mask(args,[mask_aortic_arch_refined], f'{save_base_dir}/aortic_knob', dicom)
 
     # =============# =============# =============# =============# =============
     #                       Trachea
@@ -450,13 +502,20 @@ def segmask_aortic_knob(args, dicom, target_df, save_base_dir):
         print(f"Warning: Missing trachea masks for {dicom}, skipping trachea visualization")
         return
 
-    y_pos_carina_start = mask_carina.sum(axis=-1).nonzero()[0][0]
+    carina_nonzero = mask_carina.sum(axis=-1).nonzero()[0]
+    if len(carina_nonzero) == 0:
+        print(f"Warning: Empty carina mask for {dicom}, skipping trachea visualization")
+        return
+    y_pos_carina_start = carina_nonzero[0]
     mask_refined = mask_trachea.copy()
     mask_refined[y_pos_carina_start:] = 0
 
     mask_refined = select_max_area_mask(mask_refined)
 
     idx_nonzero = mask_refined.sum(axis=-1).nonzero()[0]
+    if len(idx_nonzero) == 0:
+        print(f"Warning: Empty refined trachea mask for {dicom}, skipping trachea visualization")
+        return
     y_min, y_max = idx_nonzero[0], idx_nonzero[-1]
     y_subpart = int((y_max - y_min) * (1 / 4))
     mask_refined[:(y_min + y_subpart)] = 0
@@ -487,9 +546,15 @@ def segmask_ascending_aorta(args, dicom, target_df, save_base_dir):
 
     visualize_mask(args,[mask_ascending_aorta_refined], f'{save_base_dir}/ascending_aorta', dicom)
 
+    # Read viz data from CSV
     try:
         pnt_heart = eval(target_df['pnt_heart'].values[0])
         pnt_trachea = eval(target_df['pnt_trachea'].values[0])
+    except (ValueError, KeyError, SyntaxError):
+        # Missing required viz fields, skip this sample
+        return
+    
+    try:
         visualize_midline(args, pnt_trachea, pnt_heart, f'{save_base_dir}/borderline', dicom)
     except (ValueError, KeyError, SyntaxError) as e:
         print(f"Warning: Failed to process borderline for {dicom}: {e}")
@@ -542,13 +607,15 @@ def segmask_inspiration(args, dicom, target_df, save_base_dir):
             mask_compare = np.full(np.shape(label_im), i + 1)
             separate_mask = np.equal(label_im, mask_compare).astype(int)
             x_indices = separate_mask.sum(axis=0).nonzero()[0]
+            if len(x_indices) == 0:
+                continue
             width = abs(x_indices[0] - x_indices[-1]) + 1
             if width > max_width:
                 max_width = width
                 max_mask = separate_mask
                 max_width_pos = (x_indices[0], x_indices[-1])
         return max_mask, max_width_pos
-
+    
     rib_posterior = [
         "posterior 1st rib",
         "posterior 2nd rib",
@@ -563,25 +630,37 @@ def segmask_inspiration(args, dicom, target_df, save_base_dir):
         "posterior 11th rib",
     ]
 
-    label = target_df['label'].values[0]
+    # Use rib_position for visualization (not diagnosis label)
+    try:
+        rib_position = int(target_df['rib_position'].values[0])
+    except (KeyError, ValueError, IndexError) as e:
+        print(f"Warning: Failed to get rib_position for {dicom}: {e}")
+        return
+    
+    if rib_position < 1 or rib_position > 11:
+        print(f"Warning: Invalid rib_position for {dicom}: {rib_position}")
+        return
+    
     fname_dp = os.path.join(args.cxas_base_dir, dicom, f"right hemidiaphragm.png")
-    fname_rib = os.path.join(args.cxas_base_dir, dicom, f'{rib_posterior[(label - 1)]} right.png')
+    fname_rib = os.path.join(args.cxas_base_dir, dicom, f'{rib_posterior[(rib_position - 1)]} right.png')
 
-    fname_lung_chexmask = os.path.join(args.chexmask_base_dir, f'RL', f'{dicom}.png')
+    # Read RL lung mask directly from CXAS instead of chexmask
+    fname_lung_rl = os.path.join(args.cxas_base_dir, dicom, "right lung.png")
 
     mask_dp = safe_imread(fname_dp, 0)
     mask_rib = safe_imread(fname_rib, 0)
     
     if mask_dp is None or mask_rib is None:
-        # Missing CXAS masks, skip silently
         return
     
     mask_rib = (mask_rib / 255).astype(int)
     mask_rib_refined, _ = select_max_width_mask(mask_rib)
 
-    if os.path.isfile(fname_lung_chexmask):
-        mask_lung_chexmask = safe_imread(fname_lung_chexmask, 0)
-        mask_dp = np.logical_and(mask_dp, np.logical_not(mask_lung_chexmask))
+    # Use RL lung mask from CXAS to refine diaphragm mask
+    if os.path.isfile(fname_lung_rl):
+        mask_lung_rl = safe_imread(fname_lung_rl, 0)
+        if mask_lung_rl is not None:
+            mask_dp = np.logical_and(mask_dp, np.logical_not(mask_lung_rl))
     visualize_mask(args,[mask_dp], f'{save_base_dir}/diaphragm_right', dicom)
     visualize_mask(args,[mask_rib_refined], f'{save_base_dir}/right_posterior_rib', dicom)
 
@@ -590,6 +669,10 @@ def segmask_inspiration(args, dicom, target_df, save_base_dir):
         lung_y_lst_x_lung_mid = eval(target_df['lung_y_lst_x_lung_mid'].values[0])
     except (ValueError, KeyError, SyntaxError) as e:
         print(f"Warning: Failed to process inspiration midline for {dicom}: {e}")
+        return
+    
+    if not lung_y_lst_x_lung_mid or len(lung_y_lst_x_lung_mid) == 0:
+        print(f"Warning: Empty lung_y_lst_x_lung_mid for {dicom}, skipping inspiration midline")
         return
 
     visualize_midline(args, 
@@ -606,28 +689,70 @@ def segmask_mediastinal_widening(args, dicom, target_df, save_base_dir):
     
     visualize_mask(args,[mask_medic], f'{save_base_dir}/mediastinum', dicom)
 
+    # Read viz data from CSV (if available); otherwise attempt fallback computation
+    y_medi = None
+    xmin_rlung = None
+    xmax_llung = None
     try:
         y_medi = int(target_df['y_medi'].values[0])
         xmin_rlung = int(target_df['xmin_rlung'].values[0])
         xmax_llung = int(target_df['xmax_llung'].values[0])
-    except (ValueError, KeyError) as e:
-        print(f"Warning: Failed to process mediastinal_widening thoracic width for {dicom}: {e}")
-        # Still visualize the mediastinum mask even if thoracic width fails
+    except (ValueError, KeyError):
+        # attempt to compute missing values from CXAS masks
+        try:
+            # derive y_medi from cardiomediastinum mask if possible
+            rows = np.where(mask_medic > 0)[0]
+            if len(rows) > 0:
+                y_medi = int((rows[0] + rows[-1]) // 2)
+
+            # try to load lung masks and get x positions at y_medi
+            fname_rlung = os.path.join(args.cxas_base_dir, dicom, f"right lung.png")
+            fname_llung = os.path.join(args.cxas_base_dir, dicom, f"left lung.png")
+            mask_rlung = safe_imread(fname_rlung, 0)
+            mask_llung = safe_imread(fname_llung, 0)
+
+            if y_medi is not None:
+                if mask_rlung is not None and y_medi < mask_rlung.shape[0]:
+                    xs = np.where(mask_rlung[y_medi] > 0)[0]
+                    if len(xs) > 0:
+                        xmin_rlung = int(xs[0])
+                if mask_llung is not None and y_medi < mask_llung.shape[0]:
+                    xs = np.where(mask_llung[y_medi] > 0)[0]
+                    if len(xs) > 0:
+                        xmax_llung = int(xs[-1])
+
+            # fallback: use cardiomediastinum bbox +/- margin if lungs not found
+            if (xmin_rlung is None or xmax_llung is None) and mask_medic is not None:
+                cols = np.where(mask_medic.sum(axis=0) > 0)[0]
+                if len(cols) > 0:
+                    left, right = int(cols[0]), int(cols[-1])
+                    if xmin_rlung is None:
+                        xmin_rlung = max(0, left - 40)
+                    if xmax_llung is None:
+                        xmax_llung = min(mask_medic.shape[1] - 1, right + 40)
+        except Exception:
+            # if everything fails, leave as None and skip below
+            pass
+
+    # If still missing required fields, skip this sample
+    if y_medi is None or xmin_rlung is None or xmax_llung is None:
         return
 
     save_path = f'{save_base_dir}/thoracic_width_mw'
     os.makedirs(save_path, exist_ok=True)
     
     cxr_path = get_image_path(args, dicom)
-    cxr = Image.open(cxr_path).convert('RGB')
-
-    plt.imshow(cxr)
-    plt.plot([xmin_rlung, xmin_rlung], [y_medi - 100, y_medi + 100], color="red", linewidth=1.5)
-    plt.plot([xmax_llung, xmax_llung], [y_medi - 100, y_medi + 100], color="red", linewidth=1.5)
-    plt.plot([xmin_rlung, xmax_llung], [y_medi, y_medi], color="red", linewidth=1.5)
-    plt.axis('off')
-    plt.savefig(f'{save_path}/{dicom}.png', bbox_inches='tight')
-    plt.close()
+    
+    # 使用 cv2 繪製，比 matplotlib 快 8-10 倍
+    cxr = cv2.imread(cxr_path)
+    if cxr is None:
+        cxr = np.array(Image.open(cxr_path).convert('RGB'))
+        cxr = cv2.cvtColor(cxr, cv2.COLOR_RGB2BGR)
+    
+    cv2.line(cxr, (xmin_rlung, y_medi - 100), (xmin_rlung, y_medi + 100), (0, 0, 255), 2)
+    cv2.line(cxr, (xmax_llung, y_medi - 100), (xmax_llung, y_medi + 100), (0, 0, 255), 2)
+    cv2.line(cxr, (xmin_rlung, y_medi), (xmax_llung, y_medi), (0, 0, 255), 2)
+    cv2.imwrite(f'{save_path}/{dicom}.png', cxr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
 def segmask_projection(args, dicom, target_df, save_base_dir):
     def select_max_area_mask(mask):
@@ -671,6 +796,8 @@ def segmask_rotation(args, dicom, target_df, save_base_dir):
             mask_compare = np.full(np.shape(label_im), i + 1)
             separate_mask = np.equal(label_im, mask_compare).astype(int)
             x_indices = separate_mask.sum(axis=0).nonzero()[0]
+            if len(x_indices) == 0:
+                continue
             width = abs(x_indices[0] - x_indices[-1]) + 1
             if width > max_width:
                 max_width = width
@@ -682,22 +809,39 @@ def segmask_rotation(args, dicom, target_df, save_base_dir):
         x = m * y + b
         return x
 
+    # Read viz data from CSV
+    try:
+        midline_pnts = eval(target_df['target_coords'].values[0])
+        if not midline_pnts or len(midline_pnts) == 0:
+            return
+        m = target_df['m'].values[0]
+        b = target_df['b'].values[0]
+    except (ValueError, KeyError, SyntaxError):
+        # Missing required midline data
+        return
+    
     clavicle_masks = dict()
     for side in ['right', 'left']:
+        # Read slope and intercepts from viz CSV
+        try:
+            slope = target_df[f'{side}_slope'].values[0]
+            intercept_min = target_df[f'{side}_intercept_min'].values[0]
+            intercept_max = target_df[f'{side}_intercept_max'].values[0]
+        except KeyError:
+            # Missing viz fields for this side, skip
+            continue
+        
         fname_clavicle = os.path.join(args.cxas_base_dir, dicom, f'clavicle {side}.png')
         mask_clavicle = safe_imread(fname_clavicle, 0)
         
         if mask_clavicle is None:
-            # Missing CXAS masks, skip silently
-            return
+            # Missing CXAS masks for this side, skip to next
+            continue
 
         longest_mask, _ = select_max_width_mask(mask_clavicle)
         height, width = longest_mask.shape
 
-        slope = target_df[f'{side}_slope']
-        intercept_min = target_df[f'{side}_intercept_min']
-        intercept_max = target_df[f'{side}_intercept_max']
-
+        # Use pre-computed slope and intercepts from viz CSV
         filled_mask = np.zeros_like(mask_clavicle, dtype=np.uint8)
         for x in range(width):
             y_min = int(slope * x + intercept_min)
@@ -709,15 +853,25 @@ def segmask_rotation(args, dicom, target_df, save_base_dir):
         clavicle_mask_refined = np.bitwise_and(mask_clavicle, filled_mask)
         clavicle_masks[side] = clavicle_mask_refined
 
-    midline_pnts = eval(target_df['target_coords'].values[0])
-    m = target_df['m'].values[0]
-    b = target_df['b'].values[0]
+    # Check if at least one clavicle was processed
+    if len(clavicle_masks) == 0:
+        return
+    
     midline_ymin = midline_pnts[0][-1]
     midline_ymax = midline_pnts[-1][-1]
     x_ymin = find_x_vertical(midline_ymin, m, b)
     x_ymax = find_x_vertical(midline_ymax, m, b)
 
-    visualize_mask(args,[clavicle_masks['right'], clavicle_masks['left']], f'{save_base_dir}/clavicle_both', dicom)
+    # Visualize available clavicle masks
+    clavicle_list = []
+    if 'right' in clavicle_masks:
+        clavicle_list.append(clavicle_masks['right'])
+    if 'left' in clavicle_masks:
+        clavicle_list.append(clavicle_masks['left'])
+    
+    if len(clavicle_list) > 0:
+        visualize_mask(args, clavicle_list, f'{save_base_dir}/clavicle_both', dicom)
+    
     visualize_midline(args, [x_ymin, midline_ymin], [x_ymax, midline_ymax], f'{save_base_dir}/midline', dicom)
 
 def segmask_trachea(args, dicom, target_df, save_base_dir):
@@ -739,25 +893,72 @@ def segmask_trachea(args, dicom, target_df, save_base_dir):
     mask_trachea = safe_imread(fname_trachea, 0)
     mask_carina = safe_imread(fname_carina, 0)
 
-    y_pos_carina_start = mask_carina.sum(axis=-1).nonzero()[0][0]
+    if mask_trachea is None or mask_carina is None:
+        return
+    
+    carina_nonzero = mask_carina.sum(axis=-1).nonzero()[0]
+    if len(carina_nonzero) == 0:
+        return
+    y_pos_carina_start = carina_nonzero[0]
     mask_refined = mask_trachea.copy()
     mask_refined[y_pos_carina_start:] = 0
 
     mask_refined = select_max_area_mask(mask_refined)
 
     idx_nonzero = mask_refined.sum(axis=-1).nonzero()[0]
+    if len(idx_nonzero) == 0:
+        return
     y_min, y_max = idx_nonzero[0], idx_nonzero[-1]
     y_subpart = int((y_max - y_min) * (1 / 4))
     mask_refined[:(y_min + y_subpart)] = 0
 
     visualize_mask(args,[mask_refined], f'{save_base_dir}/trachea', dicom)
 
-    midline_x_min = int(target_df['midline_x_min'].values[0])
-    midline_x_max = int(target_df['midline_x_max'].values[0])
-    y_min = int(target_df['y_min'].values[0])
-    y_max = int(target_df['y_max'].values[0])
+    # Support both viz-prefixed columns (from preprocessor) and legacy names
+    def _get_val(df, *keys):
+        for k in keys:
+            if k in df.columns and not pd.isna(df[k].values[0]):
+                try:
+                    return int(df[k].values[0])
+                except Exception:
+                    return None
+        return None
 
-    visualize_midline(args, [midline_x_min, y_min], [midline_x_max, y_max], f'{save_base_dir}/midline', dicom)
+    midline_x_min = _get_val(target_df, 'midline_x_min', 'viz_midline_x_min')
+    midline_x_max = _get_val(target_df, 'midline_x_max', 'viz_midline_x_max')
+    y_min = _get_val(target_df, 'y_min', 'viz_y_min')
+    y_max = _get_val(target_df, 'y_max', 'viz_y_max')
+
+    if None in (midline_x_min, midline_x_max, y_min, y_max):
+        # Missing viz fields: attempt to parse point_1..point_9 from CSV and derive bbox
+        point_cols = [f'point_{i}' for i in range(1, 10)]
+        pts = []
+        for pc in point_cols:
+            if pc in target_df.columns and not pd.isna(target_df[pc].values[0]):
+                raw = target_df[pc].values[0]
+                try:
+                    val = ast.literal_eval(raw) if isinstance(raw, str) else raw
+                    # expect [x, y]
+                    if isinstance(val, (list, tuple)) and len(val) >= 2:
+                        x = int(float(val[0]))
+                        y = int(float(val[1]))
+                        pts.append((x, y))
+                except Exception:
+                    continue
+
+        if len(pts) >= 2:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            midline_x_min = min(xs)
+            midline_x_max = max(xs)
+            y_min = min(ys)
+            y_max = max(ys)
+            visualize_midline(args, [midline_x_min, y_min], [midline_x_max, y_max], f'{save_base_dir}/midline', dicom)
+        else:
+            # cannot derive midline, skip only midline output
+            return
+    else:
+        visualize_midline(args, [midline_x_min, y_min], [midline_x_max, y_max], f'{save_base_dir}/midline', dicom)
 
 segmask_fn_per_dx = {
     'inclusion': segmask_inclusion,
@@ -776,7 +977,12 @@ segmask_fn_per_dx = {
 
 def process_single_image(args_tuple):
     """處理單個影像的包裝函數，用於多進程處理"""
-    dicom, dx, save_dir, viz_df, args = args_tuple
+    dicom, dx, save_dir, viz_df_data, args_dict = args_tuple
+    
+    # 重建 args 物件和 DataFrame
+    from argparse import Namespace
+    args = Namespace(**args_dict)
+    viz_df = pd.DataFrame(viz_df_data)
     
     # 檢查是否已經處理過
     if check_if_processed(dicom, dx, save_dir):
@@ -791,6 +997,13 @@ def process_single_image(args_tuple):
 
 
 if __name__ == "__main__":
+    # Windows multiprocessing 需要設定啟動方法
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass  # 已經設定過
+    
     args = config()
     
     # Load metadata only for MIMIC dataset
@@ -801,6 +1014,8 @@ if __name__ == "__main__":
 
     args.saved_dir_viz = os.path.join(args.saved_base_dir, f"{args.dataset_name}_viz")
     saved_path_viz_list = glob(os.path.join(args.saved_dir_viz, '*.csv'))
+    
+    print(f"\n找到 {len(saved_path_viz_list)} 個診斷任務的CSV檔案")
     
     # 顯示處理設定
     print(f"\n{'='*60}")
@@ -817,59 +1032,151 @@ if __name__ == "__main__":
         print(f"  模式: 單進程順序處理")
     print(f"{'='*60}\n")
     
-    for saved_path_viz in saved_path_viz_list:
-        dx = Path(saved_path_viz).stem
-        if dx in segmask_fn_per_dx:
-            save_dir = os.path.join(args.save_base_dir, 'segmask_bodypart', dx)
+    # Use nih_cxr14 CSV (has rib_position column) instead of nih-cxr14_viz
+    for dx in segmask_fn_per_dx.keys():
+        print(f"\n>>> 檢查診斷任務: {dx}")
+        save_dir = os.path.join(args.save_base_dir, 'segmask_bodypart', dx)
+        
+        # 讀取 nih_cxr14 CSV (包含 rib_position 等完整資料)
+        original_csv = os.path.join(args.saved_base_dir, 'nih_cxr14', f'{dx}.csv')
+        if not os.path.exists(original_csv):
+            print(f">>> 錯誤：找不到 CSV 檔案: {original_csv}，跳過此任務")
+            continue
+        
+        print(f">>> 讀取 CSV: {original_csv}")
+        df = pd.read_csv(original_csv)
+        print(f">>> CSV 讀取完成，共 {len(df)} 行資料")
+        total_tasks = len(df)
+        
+        # 同時讀取 viz CSV 合併可視化資料 (如果存在)
+        viz_csv = os.path.join(args.saved_base_dir, f'nih-cxr14_viz/{dx}.csv')
+        viz_df = None
+        if os.path.exists(viz_csv):
+            viz_df = pd.read_csv(viz_csv)
 
-            viz_df = pd.read_csv(saved_path_viz)
-            dicom_list = viz_df['image_file'].tolist()
+        # 合併 viz 資料（動態檢查需要哪些欄位）
+        viz_columns = ['image_file']
+
+        # 定義每個任務需要的viz欄位
+        viz_columns_map = {
+            'inspiration': ['x_lung_mid_combined', 'lung_y_lst_x_lung_mid'],
+            'rotation': ['target_coords', 'm', 'b', 'right_slope', 'right_intercept_min', 'right_intercept_max', 'left_slope', 'left_intercept_min', 'left_intercept_max'],
+            'cardiomegaly': ['coord_mask', 'xmin_lung', 'xmax_lung'],
+            'descending_aorta_enlargement': ['ymin_start', 'ymin_end'],
+            'descending_aorta_tortuous': ['ymin_start', 'ymin_end'],
+            'aortic_knob_enlargement': ['y_max', 'ymin_desc', 'ysub_desc', 'ymax_desc_sub', 'xmax_trachea_mean'],
+            'ascending_aorta_enlargement': ['pnt_heart', 'pnt_trachea'],
+            'mediastinal_widening': ['y_medi', 'xmin_rlung', 'xmax_llung'],
+            'trachea_deviation': ['viz_midline_x_min', 'viz_midline_x_max', 'viz_y_min', 'viz_y_max'],
+        }
+
+        # 根據任務類型添加需要的viz欄位並合併到主表 df（保留所有原始列）
+        if dx in viz_columns_map and viz_df is not None:
+            for col in viz_columns_map[dx]:
+                if col in viz_df.columns:
+                    viz_columns.append(col)
+            if len(viz_columns) > 1:
+                print(f">>> 合併 viz 資料成功 (列: {', '.join(viz_columns[1:])})")
+                viz_selected = viz_df[viz_columns].copy()
+                df = df.merge(viz_selected, on='image_file', how='left')
+            else:
+                print(f">>> 欄位不足，無法合併 viz 資料 (期待: {', '.join(viz_columns_map[dx])})")
+        else:
+            if dx in viz_columns_map and viz_df is None:
+                print(f">>> 未找到 viz CSV，跳過合併: {viz_csv}")
+            else:
+                print(f">>> 此任務不需要 viz 資料")
+        
+        dicom_list = df['image_file'].tolist()
+        
+        # 檢查已完成的數量，判斷是否需要處理
+        output_checks = {
+                'cardiomegaly': ['heart', 'thoracic_width_heart'],
+            'carina_angle': ['carina'],
+            'descending_aorta_enlargement': ['descending_aorta', 'trachea'],
+            'descending_aorta_tortuous': ['descending_aorta'],
+            'aortic_knob_enlargement': ['aortic_knob', 'trachea'],
+            'ascending_aorta_enlargement': ['ascending_aorta', 'borderline'],
+            'inclusion': ['lung_both'],
+            'inspiration': ['diaphragm_right', 'right_posterior_rib', 'midclavicularline'],
+            'mediastinal_widening': ['mediastinum', 'thoracic_width_mw'],
+            'projection': ['lung_both', 'scapular_both'],
+            'rotation': ['clavicle_both', 'midline'],
+            'trachea_deviation': ['trachea', 'midline'],
+        }
+        
+        # 統計已完成的輸出檔案數量（效能優化）
+        # 為避免對每個 dicom 重複呼叫 os.path.exists，先一次性掃描各子資料夾，建立檔名集合
+        completed_count = 0
+        if dx in output_checks:
+            required_subfolders = output_checks[dx]
+            exts = ('.png', '.jpg', '.jpeg')
+
+            # 建立每個子資料夾中可用檔案的 basename（不含副檔名）集合
+            subfolder_name_sets = {}
+            for subfolder in required_subfolders:
+                subfolder_path = os.path.join(save_dir, subfolder)
+                names = set()
+                if os.path.exists(subfolder_path):
+                    try:
+                        for fname in os.listdir(subfolder_path):
+                            if not fname:
+                                continue
+                            base, ext = os.path.splitext(fname)
+                            if ext.lower() in exts:
+                                names.add(base)
+                    except Exception:
+                        # 若無法列出目錄，視為空集合
+                        names = set()
+                subfolder_name_sets[subfolder] = names
+
+            # 正規化 dicom 名稱（去除路徑與副檔名）
+            normalized_dicoms = [os.path.splitext(os.path.basename(str(d)))[0] for d in dicom_list]
+
+            # 計算在所有 required_subfolders 都存在的 dicom
+            for d in normalized_dicoms:
+                ok = True
+                for subfolder in required_subfolders:
+                    if d not in subfolder_name_sets.get(subfolder, set()):
+                        ok = False
+                        break
+                if ok:
+                    completed_count += 1
+
+        completion_rate = (completed_count / total_tasks * 100) if total_tasks > 0 else 0
+
+        print(f"\n{'='*60}")
+        print(f"診斷任務: {dx}")
+
+        # # 暫時跳過 rotation 任務
+        # if dx == 'rotation':
+        #     print(f"  ⚠️  暫時跳過 rotation（等待viz CSV更新）")
+        #     print(f"  ✓ 跳過 {dx}")
+        #     print(f"{'='*60}")
+        #     continue
+
+        print(f"  總任務數: {total_tasks}")
+        print(f"  已完成: {completed_count} ({completion_rate:.1f}%)")
+        print(f"  待處理: {len(dicom_list)}")
+
+        # 如果完成率超過 80%，自動跳過
+        if completion_rate > 80:
+            print(f"  ⚠️  此任務已接近完成（{completion_rate:.1f}%），自動跳過")
+            print(f"  ✓ 跳過 {dx}")
+            continue
+        print(f"{'='*60}")
+        
+        if args.num_workers > 1:
+            # 多進程處理
+            print(f">>> 使用 {args.num_workers} 個並行worker加速處理")
             
-            # 檢查已完成的數量，判斷是否需要處理
-            output_checks = {
-                'cardiomegaly': ['heart', 'lung_both', 'thoracic_width_heart'],
-                'carina_angle': ['carina'],
-                'descending_aorta_enlargement': ['descending_aorta', 'trachea'],
-                'descending_aorta_tortuous': ['descending_aorta', 'trachea'],
-                'aortic_knob_enlargement': ['aortic_knob', 'trachea'],
-                'ascending_aorta_enlargement': ['ascending_aorta', 'lung_both', 'diaphragm'],
-                'inclusion': ['lung_both'],
-                'inspiration': ['diaphragm_right', 'right_posterior_rib', 'midclavicularline'],
-                'mediastinal_widening': ['mediastinum', 'thoracic_width_mw'],
-                'projection': ['lung_both', 'scapular_both'],
-                'rotation': ['clavicle_both', 'midline'],
-                'trachea_deviation': ['trachea', 'midline'],
-            }
+            # 準備參數：傳遞 DataFrame 字典格式（更高效）
+            args_dict = vars(args)
+            df_data = df.to_dict('list')  # 轉為字典格式傳遞
+            task_args = [(dicom, dx, save_dir, df_data, args_dict) for dicom in dicom_list]
             
-            # 統計已完成的輸出檔案數量
-            completed_count = 0
-            if dx in output_checks:
-                for subfolder in output_checks[dx]:
-                    subfolder_path = os.path.join(save_dir, subfolder)
-                    if os.path.exists(subfolder_path):
-                        completed_count = max(completed_count, len([f for f in os.listdir(subfolder_path) if f.endswith('.png')]))
-            
-            completion_rate = (completed_count / len(dicom_list) * 100) if len(dicom_list) > 0 else 0
-            
-            print(f"\n{'='*60}")
-            print(f"診斷任務: {dx}")
-            print(f"  總影像數: {len(dicom_list)}")
-            print(f"  已完成: {completed_count} ({completion_rate:.1f}%)")
-            
-            # 如果完成率超過 80%，詢問是否跳過
-            if completion_rate > 80:
-                print(f"  ⚠️  此任務已接近完成，是否跳過？")
-                user_input = input(f"  跳過 {dx}? (y/n，直接Enter視為n): ").strip().lower()
-                if user_input == 'y':
-                    print(f"  ✓ 跳過 {dx}")
-                    continue
-            print(f"{'='*60}")
-            
-            if args.num_workers > 1:
-                # 多進程處理
-                # 準備參數元組
-                task_args = [(dicom, dx, save_dir, viz_df, args) for dicom in dicom_list]
-                
+            print(f">>> 啟動 Pool，準備處理 {len(task_args)} 個影像...")
+            try:
                 # 使用 Pool 處理
                 with Pool(processes=args.num_workers) as pool:
                     results = list(tqdm(
@@ -889,26 +1196,31 @@ if __name__ == "__main__":
                     for r in results:
                         if r['status'] == 'error':
                             print(f"  - {r['dicom']}: {r['error']}")
-            else:
-                # 單進程處理（原始方法）
-                processed_count = 0
-                skipped_count = 0
-                error_count = 0
-                
-                for dicom in tqdm(dicom_list, total=len(dicom_list), desc=f'{dx}'):
-                    # 檢查是否已經處理過
-                    if check_if_processed(dicom, dx, save_dir):
-                        skipped_count += 1
-                        continue
-                    
-                    try:
-                        target_df = viz_df[viz_df['image_file'] == dicom]
-                        segmask_fn_per_dx[dx](args, dicom, target_df, save_dir)
-                        processed_count += 1
-                    except Exception as e:
-                        print(f"\nError processing {dicom}: {e}")
-                        error_count += 1
-                        continue
+            except Exception as e:
+                print(f"\n❌ multiprocessing 失敗: {e}")
+                print(f">>> 切換到單進程模式處理...")
+                # 降級到單進程處理
+                args.num_workers = 1
+        else:
+            # 單進程處理（原始方法）
+            processed_count = 0
+            skipped_count = 0
+            error_count = 0
             
-            print(f"✅ {dx} 完成 - 新處理: {processed_count}, 跳過: {skipped_count}, 錯誤: {error_count}")
+            for dicom in tqdm(dicom_list, total=len(dicom_list), desc=f'{dx}'):
+                # 檢查是否已經處理過
+                if check_if_processed(dicom, dx, save_dir):
+                    skipped_count += 1
+                    continue
+                
+                try:
+                    target_df = df[df['image_file'] == dicom]
+                    segmask_fn_per_dx[dx](args, dicom, target_df, save_dir)
+                    processed_count += 1
+                except Exception as e:
+                    print(f"\nError processing {dicom}: {e}")
+                    error_count += 1
+                    continue
+        
+        print(f"✅ {dx} 完成 - 新處理: {processed_count}, 跳過: {skipped_count}, 錯誤: {error_count}")
 

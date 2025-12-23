@@ -193,116 +193,107 @@ fi
 
 echo ""
 
+# # # =============================================================================
+# # # 步驟 3: 生成分割遮罩可視化
+# # # =============================================================================
+
+# # print_header "步驟 3/6: 生成分割遮罩可視化"
+# # print_step "為每個診斷任務創建解剖結構分割遮罩的可視化..."
+# # print_warning "這一步需要 detectron2，可能需要較長時間..."
+
+# # SEGMASK_DIR="${OUTPUT_DIR}/segmask_bodypart"
+
+# # # 設定並行處理的worker數量 (根據CPU核心數調整)
+NUM_WORKERS=8
+# # print_step "使用 ${NUM_WORKERS} 個並行worker加速處理"
+
+# # # 檢查是否已有部分輸出
+# # EXISTING_SEGMASKS=$(find "${SEGMASK_DIR}" -type f -name "*.png" 2>/dev/null | wc -l)
+# # if [ ${EXISTING_SEGMASKS} -gt 100 ]; then
+# #     print_warning "已存在 ${EXISTING_SEGMASKS} 個分割遮罩檔案"
+# #     print_step "bodypart_segmask.py 會自動跳過完成率>80%的診斷任務"
+# # fi
+
+# # python bodypart_segmask.py \
+# #     --dataset_name nih-cxr14 \
+# #     --saved_base_dir "${BASE_DIR}" \
+# #     --save_base_dir "${OUTPUT_DIR}" \
+# #     --nih_image_base_dir "${IMAGE_DIR}" \
+# #     --cxas_base_dir "${CXAS_DIR}" \
+# #     --chexmask_base_dir "${BASE_DIR}/CXAS/chexmask" \
+# #     --num_workers ${NUM_WORKERS}
+
+# # if [ $? -eq 0 ]; then
+# #     print_success "分割遮罩可視化生成成功"
+# # else
+# #     print_error "分割遮罩可視化生成失敗"
+# #     print_warning "可能原因: detectron2未安裝或CXAS檔案缺失"
+# #     exit 1
+# # fi
+
+# # echo ""
+
+# # =============================================================================
+# # 步驟 4: 生成地標點可視化 (Path2需要)
+# # =============================================================================
+
+# print_header "步驟 4/6: 生成地標點可視化 (Path2需要)"
+# print_step "為Path2創建帶有解剖地標和座標的可視化..."
+# print_warning "這一步也需要 detectron2..."
+
+# PNT_DIR="${OUTPUT_DIR}/pnt_on_cxr"
+
+# print_step "使用 ${NUM_WORKERS} 個並行worker加速處理"
+
+# # 檢查是否已有部分輸出
+# EXISTING_PNTS=$(find "${PNT_DIR}" -type f -name "*.png" 2>/dev/null | wc -l)
+# if [ ${EXISTING_PNTS} -gt 100 ]; then
+#     print_warning "已存在 ${EXISTING_PNTS} 個地標點檔案"
+#     print_step "point_on_cxr.py 會自動跳過完成率>80%的診斷任務"
+# fi
+
+# python point_on_cxr.py \
+#     --dataset_name nih-cxr14 \
+#     --saved_base_dir "${BASE_DIR}" \
+#     --save_base_dir "${OUTPUT_DIR}" \
+#     --nih_image_base_dir "${IMAGE_DIR}" \
+#     --cxas_base_dir "${CXAS_DIR}" \
+#     --num_workers ${NUM_WORKERS}
+
+# if [ $? -eq 0 ]; then
+#     print_success "地標點可視化生成成功"
+# else
+#     print_error "地標點可視化生成失敗"
+#     print_warning "Path2將無法執行，但Path1仍可繼續"
+# fi
+
+# echo ""
+
 # =============================================================================
-# 步驟 3: 生成分割遮罩可視化
+# 步驟 6: 生成 Path1 QA對 (直接推理)
 # =============================================================================
 
-print_header "步驟 3/6: 生成分割遮罩可視化"
-print_step "為每個診斷任務創建解剖結構分割遮罩的可視化..."
-print_warning "這一步需要 detectron2，可能需要較長時間..."
+print_header "步驟 6/6: 生成 Path1 QA對 (直接推理)"
+print_step "生成無視覺引導的問答對..."
 
-SEGMASK_DIR="${OUTPUT_DIR}/segmask_bodypart"
+python generate_benchmark.py \
+    --dataset_name nih-cxr14 \
+    --inference_path path1 \
+    --chexstruct_base_dir "${CHEXSTRUCT_DIR}" \
+    --cxreasonbench_base_dir "${OUTPUT_DIR}" \
+    --nih_image_base_dir "${IMAGE_DIR}" \
+    --save_base_dir "${OUTPUT_DIR}" \
+    --workers "${NUM_WORKERS}"
 
-# 設定並行處理的worker數量 (根據CPU核心數調整)
-NUM_WORKERS=6
-print_step "使用 ${NUM_WORKERS} 個並行worker加速處理"
-
-# 檢查是否已有部分輸出
-EXISTING_SEGMASKS=$(find "${SEGMASK_DIR}" -type f -name "*.png" 2>/dev/null | wc -l)
-if [ ${EXISTING_SEGMASKS} -gt 100 ]; then
-    print_warning "已存在 ${EXISTING_SEGMASKS} 個分割遮罩檔案"
-    read -p "是否跳過此步驟? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_warning "跳過分割遮罩生成"
-    else
-        python bodypart_segmask.py \
-            --dataset_name nih-cxr14 \
-            --saved_base_dir "${BASE_DIR}" \
-            --save_base_dir "${OUTPUT_DIR}" \
-            --nih_image_base_dir "${IMAGE_DIR}" \
-            --cxas_base_dir "${CXAS_DIR}" \
-            --num_workers ${NUM_WORKERS}
-        
-        if [ $? -eq 0 ]; then
-            print_success "分割遮罩可視化生成成功"
-        else
-            print_error "分割遮罩可視化生成失敗"
-            print_warning "可能原因: detectron2未安裝或CXAS檔案缺失"
-            exit 1
-        fi
-    fi
-else
-    python bodypart_segmask.py \
-        --dataset_name nih-cxr14 \
-        --saved_base_dir "${BASE_DIR}" \
-        --save_base_dir "${OUTPUT_DIR}" \
-        --nih_image_base_dir "${IMAGE_DIR}" \
-        --cxas_base_dir "${CXAS_DIR}" \
-        --num_workers ${NUM_WORKERS}
+if [ $? -eq 0 ]; then
+    print_success "Path1 QA對生成成功"
     
-    if [ $? -eq 0 ]; then
-        print_success "分割遮罩可視化生成成功"
-    else
-        print_error "分割遮罩可視化生成失敗"
-        print_warning "可能原因: detectron2未安裝或CXAS檔案缺失"
-        exit 1
-    fi
-fi
-
-echo ""
-
-# =============================================================================
-# 步驟 4: 生成地標點可視化 (Path2需要)
-# =============================================================================
-
-print_header "步驟 4/6: 生成地標點可視化 (Path2需要)"
-print_step "為Path2創建帶有解剖地標和座標的可視化..."
-print_warning "這一步也需要 detectron2..."
-
-PNT_DIR="${OUTPUT_DIR}/pnt_on_cxr"
-
-print_step "使用 ${NUM_WORKERS} 個並行worker加速處理"
-
-# 檢查是否已有部分輸出
-EXISTING_PNTS=$(find "${PNT_DIR}" -type f -name "*.png" 2>/dev/null | wc -l)
-if [ ${EXISTING_PNTS} -gt 100 ]; then
-    print_warning "已存在 ${EXISTING_PNTS} 個地標點檔案"
-    read -p "是否跳過此步驟? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_warning "跳過地標點可視化生成"
-    else
-        python point_on_cxr.py \
-            --dataset_name nih-cxr14 \
-            --saved_base_dir "${BASE_DIR}" \
-            --save_base_dir "${OUTPUT_DIR}" \
-            --nih_image_base_dir "${IMAGE_DIR}" \
-            --cxas_base_dir "${CXAS_DIR}" \
-            --num_workers ${NUM_WORKERS}
-        
-        if [ $? -eq 0 ]; then
-            print_success "地標點可視化生成成功"
-        else
-            print_error "地標點可視化生成失敗"
-            print_warning "Path2將無法執行，但Path1仍可繼續"
-        fi
-    fi
+    # 統計生成的QA對數量
+    PATH1_QA_COUNT=$(find "${PATH2_DIR}" -path "*/path1/*.json" -type f 2>/dev/null | wc -l)
+    echo "生成的Path1 QA對數量: ${PATH1_QA_COUNT}"
 else
-    python point_on_cxr.py \
-        --dataset_name nih-cxr14 \
-        --saved_base_dir "${BASE_DIR}" \
-        --save_base_dir "${OUTPUT_DIR}" \
-        --nih_image_base_dir "${IMAGE_DIR}" \
-        --cxas_base_dir "${CXAS_DIR}" \
-        --num_workers ${NUM_WORKERS}
-    
-    if [ $? -eq 0 ]; then
-        print_success "地標點可視化生成成功"
-    else
-        print_error "地標點可視化生成失敗"
-        print_warning "Path2將無法執行，但Path1仍可繼續"
-    fi
+    print_error "Path1 QA對生成失敗"
+    exit 1
 fi
 
 echo ""
@@ -322,7 +313,8 @@ python generate_benchmark.py \
     --chexstruct_base_dir "${CHEXSTRUCT_DIR}" \
     --cxreasonbench_base_dir "${OUTPUT_DIR}" \
     --nih_image_base_dir "${IMAGE_DIR}" \
-    --save_base_dir "${OUTPUT_DIR}"
+    --save_base_dir "${OUTPUT_DIR}" \
+    --workers "${NUM_WORKERS}"
 
 if [ $? -eq 0 ]; then
     print_success "Path2 QA對生成成功"
@@ -337,69 +329,42 @@ fi
 
 echo ""
 
-# =============================================================================
-# 步驟 6: 生成 Path1 QA對 (直接推理)
-# =============================================================================
 
-print_header "步驟 6/6: 生成 Path1 QA對 (直接推理)"
-print_step "生成無視覺引導的問答對..."
+# # =============================================================================
+# # 完成總結
+# # =============================================================================
 
-python generate_benchmark.py \
-    --dataset_name nih-cxr14 \
-    --inference_path path1 \
-    --chexstruct_base_dir "${CHEXSTRUCT_DIR}" \
-    --cxreasonbench_base_dir "${OUTPUT_DIR}" \
-    --nih_image_base_dir "${IMAGE_DIR}" \
-    --save_base_dir "${OUTPUT_DIR}"
+# print_header "✨ 全部完成！"
 
-if [ $? -eq 0 ]; then
-    print_success "Path1 QA對生成成功"
+# echo -e "${GREEN}所有步驟執行成功！${NC}"
+# echo ""
+# echo "輸出檔案位置:"
+# echo "  📁 主輸出目錄: ${OUTPUT_DIR}"
+# echo "  📄 診斷映射: ${OUTPUT_DIR}/dx_by_dicoms.json"
+# echo "  🖼️  分割遮罩: ${OUTPUT_DIR}/segmask_bodypart/"
+# echo "  📍 地標點: ${OUTPUT_DIR}/pnt_on_cxr/"
+# echo "  💬 QA對: ${OUTPUT_DIR}/qa/"
+# echo ""
+
+# # 顯示統計信息
+# if [ -f "${DX_BY_DICOMS_FILE}" ]; then
+#     echo "統計信息:"
+#     echo "  診斷任務數: $(python -c "import json; print(len(json.load(open('${DX_BY_DICOMS_FILE}'))))" 2>/dev/null || echo "N/A")"
     
-    # 統計生成的QA對數量
-    PATH1_QA_COUNT=$(find "${PATH2_DIR}" -path "*/path1/*.json" -type f 2>/dev/null | wc -l)
-    echo "生成的Path1 QA對數量: ${PATH1_QA_COUNT}"
-else
-    print_error "Path1 QA對生成失敗"
-    exit 1
-fi
-
-echo ""
-
-# =============================================================================
-# 完成總結
-# =============================================================================
-
-print_header "✨ 全部完成！"
-
-echo -e "${GREEN}所有步驟執行成功！${NC}"
-echo ""
-echo "輸出檔案位置:"
-echo "  📁 主輸出目錄: ${OUTPUT_DIR}"
-echo "  📄 診斷映射: ${OUTPUT_DIR}/dx_by_dicoms.json"
-echo "  🖼️  分割遮罩: ${OUTPUT_DIR}/segmask_bodypart/"
-echo "  📍 地標點: ${OUTPUT_DIR}/pnt_on_cxr/"
-echo "  💬 QA對: ${OUTPUT_DIR}/qa/"
-echo ""
-
-# 顯示統計信息
-if [ -f "${DX_BY_DICOMS_FILE}" ]; then
-    echo "統計信息:"
-    echo "  診斷任務數: $(python -c "import json; print(len(json.load(open('${DX_BY_DICOMS_FILE}'))))" 2>/dev/null || echo "N/A")"
+#     TOTAL_QA=$(find "${OUTPUT_DIR}/qa" -name "*.json" -type f 2>/dev/null | wc -l)
+#     echo "  總QA對數: ${TOTAL_QA}"
     
-    TOTAL_QA=$(find "${OUTPUT_DIR}/qa" -name "*.json" -type f 2>/dev/null | wc -l)
-    echo "  總QA對數: ${TOTAL_QA}"
+#     SEGMASK_COUNT=$(find "${OUTPUT_DIR}/segmask_bodypart" -name "*.png" -type f 2>/dev/null | wc -l)
+#     echo "  分割遮罩數: ${SEGMASK_COUNT}"
     
-    SEGMASK_COUNT=$(find "${OUTPUT_DIR}/segmask_bodypart" -name "*.png" -type f 2>/dev/null | wc -l)
-    echo "  分割遮罩數: ${SEGMASK_COUNT}"
-    
-    PNT_COUNT=$(find "${OUTPUT_DIR}/pnt_on_cxr" -name "*.png" -type f 2>/dev/null | wc -l)
-    echo "  地標點圖數: ${PNT_COUNT}"
-fi
+#     PNT_COUNT=$(find "${OUTPUT_DIR}/pnt_on_cxr" -name "*.png" -type f 2>/dev/null | wc -l)
+#     echo "  地標點圖數: ${PNT_COUNT}"
+# fi
 
-echo ""
-echo -e "${BLUE}下一步:${NC}"
-echo "  1. 檢查輸出檔案: cd ${OUTPUT_DIR}"
-echo "  2. 執行評估: 參考 Benchmark/Evaluation/README.md"
-echo ""
+# echo ""
+# echo -e "${BLUE}下一步:${NC}"
+# echo "  1. 檢查輸出檔案: cd ${OUTPUT_DIR}"
+# echo "  2. 執行評估: 參考 Benchmark/Evaluation/README.md"
+# echo ""
 
-print_success "Pipeline執行完成！🎉"
+# print_success "Pipeline執行完成！🎉"

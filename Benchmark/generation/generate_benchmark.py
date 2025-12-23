@@ -7,6 +7,8 @@ import pandas as pd
 from glob import glob
 from tqdm import tqdm
 from collections import defaultdict
+import multiprocessing
+from functools import partial
 
 # Global variable to store dataset configuration
 _dataset_config = None
@@ -22,9 +24,37 @@ class DatasetConfig:
     def get_view_position(self, dicom, dx):
         """Get view position for a given image"""
         if self.dataset_name == 'nih-cxr14':
-            df = pd.read_csv(os.path.join(self.chexstruct_base_dir, f'{dx}.csv'))
+            # Try to locate the per-dx CSV in several common locations
+            candidate_paths = []
+            if getattr(self, 'chexstruct_base_dir', None):
+                candidate_paths.append(os.path.join(self.chexstruct_base_dir, f'{dx}.csv'))
+            # repo-relative fallbacks
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            candidate_paths.append(os.path.join(repo_root, 'nih_cxr14', f'{dx}.csv'))
+            candidate_paths.append(os.path.join(repo_root, 'nih-cxr14_viz', f'{dx}.csv'))
+            candidate_paths.append(os.path.join(repo_root, 'dataset', f'{dx}.csv'))
+
+            df = None
+            for p in candidate_paths:
+                try:
+                    if os.path.exists(p):
+                        df = pd.read_csv(p)
+                        try:
+                            print(f"[measure-info] get_view_position using CSV: {p}")
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    continue
+
+            if df is None:
+                return 'PA'
+
             if 'viewposition' in df.columns:
-                return df[df['image_file'] == dicom]['viewposition'].values[0]
+                try:
+                    return df[df['image_file'] == dicom]['viewposition'].values[0]
+                except Exception:
+                    return 'PA'
             return 'PA'  # Default
         else:
             return self.mimic_meta[self.mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
@@ -38,6 +68,124 @@ class DatasetConfig:
             pid = self.mimic_meta[self.mimic_meta['dicom_id'] == dicom]['subject_id'].values[0]
             return f'p{str(pid)[:2]}/p{pid}/s{sid}/{dicom}.jpg'
 
+# Cache for NIH demographics dataframe
+_nih_demographics_df = None
+
+def load_nih_demographics(csv_path=None):
+    """Load NIH Data_Entry_2017.csv into a cached DataFrame."""
+    global _nih_demographics_df
+    if _nih_demographics_df is not None:
+        return
+    if csv_path is None:
+        csv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'dataset', 'Data_Entry_2017.csv'))
+    try:
+        if os.path.exists(csv_path):
+            _nih_demographics_df = pd.read_csv(csv_path)
+        else:
+            _nih_demographics_df = pd.DataFrame()
+    except Exception:
+        _nih_demographics_df = pd.DataFrame()
+
+
+def get_demographics(dicom, mimic_meta=None):
+    """Return (gender, age) for a given dicom id using NIH CSV or mimic_meta if available.
+
+    For NIH dataset, attempts to match against columns that look like image/index, age and gender.
+    """
+    # Prefer dataset-configured NIH lookup when available
+    config = get_dataset_config()
+    if config and getattr(config, 'dataset_name', None) == 'nih-cxr14':
+        load_nih_demographics()
+        df = _nih_demographics_df
+        if df is not None and not df.empty:
+            cols = list(df.columns)
+            image_cols = [c for c in cols if 'image' in c.lower() or 'filename' in c.lower() or 'file' in c.lower() or 'index' in c.lower()]
+            # Avoid matching 'image' when searching for age/gender (e.g., 'Image Index' contains 'age')
+            age_cols = [c for c in cols if 'age' in c.lower() and 'image' not in c.lower() and 'index' not in c.lower()]
+            gender_cols = [c for c in cols if ("gender" in c.lower() or 'sex' in c.lower()) and 'image' not in c.lower() and 'index' not in c.lower()]
+            match_row = None
+            for ic in image_cols:
+                # try matching with or without .png
+                png_name = f"{dicom}.png"
+                try:
+                    if png_name in df[ic].values:
+                        match_row = df[df[ic] == png_name].iloc[0]
+                        break
+                    if dicom in df[ic].values:
+                        match_row = df[df[ic] == dicom].iloc[0]
+                        break
+                except Exception:
+                    continue
+            if match_row is not None:
+                age = None
+                gender = None
+                if age_cols:
+                    try:
+                        raw_age = match_row[age_cols[0]]
+                        # normalize age to integer if possible
+                        try:
+                            age_val = int(float(raw_age))
+                            age = str(age_val)
+                        except Exception:
+                            age = str(raw_age)
+                    except Exception:
+                        age = None
+                if gender_cols:
+                    try:
+                        raw_gender = match_row[gender_cols[0]]
+                        if pd.notnull(raw_gender):
+                            g = str(raw_gender).strip().lower()
+                            if g in ('m', 'male'):
+                                gender = 'male'
+                            elif g in ('f', 'female'):
+                                gender = 'female'
+                            else:
+                                gender = g
+                        else:
+                            gender = None
+                    except Exception:
+                        gender = None
+
+                return (gender, age)
+
+    # Fallback: try mimic_meta if provided
+    if mimic_meta is not None and hasattr(mimic_meta, 'columns'):
+        # try to extract gender and age from mimic metadata
+        gender_val = None
+        age_val = None
+        for col in ('PatientGender', 'PatientSex', 'Gender', 'Sex', 'patient_gender'):
+            if col in mimic_meta.columns:
+                try:
+                    raw = mimic_meta[mimic_meta['dicom_id'] == dicom][col].values[0]
+                    if pd.notnull(raw):
+                        g = str(raw).strip().lower()
+                        if g in ('m', 'male'):
+                            gender_val = 'male'
+                        elif g in ('f', 'female'):
+                            gender_val = 'female'
+                        else:
+                            gender_val = g
+                        break
+                except Exception:
+                    continue
+
+        for col in ('PatientAge', 'Age', 'age', 'subject_age', 'Patient_Age'):
+            if col in mimic_meta.columns:
+                try:
+                    raw = mimic_meta[mimic_meta['dicom_id'] == dicom][col].values[0]
+                    if pd.notnull(raw):
+                        try:
+                            age_val = str(int(float(raw)))
+                        except Exception:
+                            age_val = str(raw)
+                        break
+                except Exception:
+                    continue
+
+        return (gender_val, age_val)
+
+    return (None, None)
+
 def set_dataset_config(config):
     """Set global dataset configuration"""
     global _dataset_config
@@ -46,6 +194,108 @@ def set_dataset_config(config):
 def get_dataset_config():
     """Get global dataset configuration"""
     return _dataset_config
+
+
+# Cache for MC-format lists per diagnostic to allow workers to access
+_MC_FORMATS = {}
+
+
+def _process_single_dicom(task):
+    """Worker to generate QA for a single (dx, dicom, idx).
+
+    `task` is a tuple (dx, dicom, idx). Uses the global dataset config.
+    """
+    dx, dicom, idx = task
+    dataset_config = get_dataset_config()
+    if dataset_config is None:
+        raise RuntimeError("Dataset config not initialized for worker")
+    args = dataset_config.args
+    mimic_meta = dataset_config.mimic_meta
+
+    save_dir_qa = os.path.join(args.save_base_dir, 'qa', dx, args.inference_path)
+
+    # Retrieve precomputed MC-format lists
+    mc_criteria, mc_bodypart = _MC_FORMATS.get(dx, (None, None))
+
+    # If final QA already exists for this dicom, skip processing to save time
+    try:
+        final_q_path = os.path.join(save_dir_qa, 'final', 'basic', f"{dicom}.json")
+        if os.path.exists(final_q_path):
+            return (dx, dicom, 'exists-skip')
+    except Exception:
+        # if any unexpected issue checking, continue normally
+        pass
+
+    # Deterministic seeding per dicom to keep outputs reproducible
+    if args.inference_path in ['path1']:
+        seed = 42 + idx
+    elif args.inference_path in ['path2']:
+        seed = 33 + idx
+    elif args.inference_path in ['re-path1']:
+        seed = 24 + idx
+    else:
+        seed = 0 + idx
+    random.seed(seed)
+    np.random.seed(seed)
+
+    try:
+        measured_value = return_measured_value(args, dicom, dx)
+    except Exception as e:
+        # log a concise diagnostic so runs show why measurement failed
+        try:
+            print(f"[measure-error] {dx} {dicom}: {e}")
+        except Exception:
+            pass
+        # signal skip by returning a tuple
+        return (dx, dicom, 'error-measure')
+
+    # For path1/re-path1 ensure segmask exists
+    if args.inference_path in ['path1', 're-path1']:
+        segmask_glob = glob(os.path.join(args.segmask_base_dir, dx, '*', f'{dicom}.png'))
+        if len(segmask_glob) == 0:
+            return (dx, dicom, 'skip-noseg')
+
+    # Call the same sequence of QA-generating functions as before
+    if args.inference_path in ['path1']:
+        answer_init = qa_init_question('init', dicom, dx, measured_value, mimic_meta, save_dir_qa)
+        if answer_init is None:
+            return (dx, dicom, 'skip-init')
+        # mc lists are indexed by idx; guard against None
+        crit_fmt = None
+        body_fmt = None
+        if mc_criteria is not None and idx < len(mc_criteria):
+            crit_fmt = mc_criteria[idx]
+        if mc_bodypart is not None and idx < len(mc_bodypart):
+            body_fmt = mc_bodypart[idx]
+
+        qa_criteria('stage1', dicom, dx, args.num_options, crit_fmt, save_dir_qa)
+        if dx in refined_criteria_per_dx.keys():
+            qa_custom_criteria('stage1.5', dicom, dx, save_dir_qa)
+        qa_bodypart('stage2', args.inference_path, dicom, dx, args.num_options, body_fmt, args.segmask_base_dir, save_dir_qa)
+        qa_measurement('stage3', args.inference_path, dicom, dx, measured_value, args.num_options, save_dir_qa)
+        qa_final('stage4', dicom, dx, measured_value, answer_init, save_dir_qa)
+
+    elif args.inference_path in ['path2']:
+        qa_bodypart_guidance('stage1', dicom, dx, args.segmask_base_dir, args.num_options, save_dir_qa)
+        qa_measurement_guidance('stage2', dicom, dx,  args.pnt_base_dir, measured_value, args.num_options, save_dir_qa)
+        qa_final_guidance('stage3', dicom, dx, measured_value, save_dir_qa)
+
+    elif args.inference_path in ['re-path1']:
+        answer_init = qa_init_after_guidance('init', dicom, dx, measured_value, save_dir_qa)
+        if answer_init is None:
+            return (dx, dicom, 'skip-init-after-guidance')
+        crit_fmt = None
+        body_fmt = None
+        if mc_criteria is not None and idx < len(mc_criteria):
+            crit_fmt = mc_criteria[idx]
+        if mc_bodypart is not None and idx < len(mc_bodypart):
+            body_fmt = mc_bodypart[idx]
+        qa_criteria_after_guidance('stage1', dicom, dx, args.num_options, crit_fmt, save_dir_qa)
+        qa_bodypart('stage2', args.inference_path, dicom, dx, args.num_options, body_fmt, args.segmask_base_dir, save_dir_qa)
+        qa_measurement('stage3', args.inference_path, dicom, dx, measured_value, args.num_options, save_dir_qa)
+        qa_final('stage4', dicom, dx, measured_value, answer_init, save_dir_qa)
+
+    return (dx, dicom, 'ok')
 
 def config():
     parser = argparse.ArgumentParser()
@@ -66,6 +316,8 @@ def config():
     parser.add_argument('--nih_image_base_dir', default='/mnt/d/CXReasonBench/dataset', type=str, help='Path to NIH images folders')
 
     parser.add_argument('--num_options', default=5, type=int)
+    parser.add_argument('--workers', '-w', default=None, type=int,
+                        help='Number of worker processes to use for QA generation (overrides auto-detection)')
 
     args = parser.parse_args()
     return args
@@ -83,6 +335,50 @@ round_per_dx = {
     'cardiomegaly': 2, 'mediastinal_widening': 2, 'carina_angle': 0,
     'aortic_knob_enlargement': 2, 'descending_aorta_enlargement': 2, 'descending_aorta_tortuous': 4,
 }
+
+
+def format_measured_value_part(target_dx, measured_value):
+    """Return a standardized value part string to append to answers.
+
+    Always formats numeric values inside brackets: `Value: [x]`.
+    For projection returns: ` Value: Right - [r0], Left - [r1]`.
+    Returns empty string when no measured value is appropriate or on error.
+    """
+    try:
+        if target_dx in ['rotation', 'cardiomegaly', 'mediastinal_widening',
+                         'carina_angle', 'aortic_knob_enlargement',
+                         'descending_aorta_enlargement', 'descending_aorta_tortuous']:
+            rv = measured_value
+            rp = round_per_dx.get(target_dx, None)
+            # normalize numpy scalar/ints
+            try:
+                if isinstance(rv, (np.floating, np.integer)):
+                    rv = float(rv)
+                if rp is not None and isinstance(rv, (int, float)):
+                    rv = round(rv, rp)
+            except Exception:
+                pass
+            return f" Value: [{rv}]"
+        if target_dx in ['projection']:
+            rv = measured_value
+            # expect two values
+            if isinstance(rv, (list, tuple, np.ndarray)) and len(rv) >= 2:
+                try:
+                    r0 = float(rv[0])
+                    r1 = float(rv[1])
+                    rp = round_per_dx.get(target_dx, None)
+                    if rp is not None:
+                        r0 = round(r0, rp)
+                        r1 = round(r1, rp)
+                    return f" Value: Right - [{r0}], Left - [{r1}]"
+                except Exception:
+                    return f" Value: Right - [{rv[0]}], Left - [{rv[1]}]"
+            else:
+                # fallback to single value bracketed
+                return f" Value: [{rv}]"
+    except Exception:
+        return ''
+    return ''
 map_tolerance_per_dx = {
             'cardiomegaly_PA': {'tolerance': 0.01, 'margin': 0.01, 'round': 2,
                                 'min_limit': 0.3, 'max_limit': 0.95},
@@ -472,7 +768,7 @@ final_question_per_dx = {
                                  "Do not include any explanations.",
 }
 
-def mk_answer_q_dx(target_dx, dicom, label_measured):
+def mk_answer_q_dx(target_dx, dicom, label_measured, mimic_meta=None):
     if target_dx in ['inclusion']:
         GT = '(a) Yes'
         for label in label_measured:
@@ -530,17 +826,26 @@ def mk_answer_q_dx(target_dx, dicom, label_measured):
     elif target_dx in ['cardiomegaly', 'mediastinal_widening']:
         label_measured = round(label_measured, round_per_dx[target_dx])
 
-        # Get view position using dataset config
+        # Get view position using dataset config if available
         config = get_dataset_config()
         if config:
-            view = config.get_view_position(dicom, target_dx)
+            try:
+                view = config.get_view_position(dicom, target_dx)
+            except Exception:
+                view = 'PA'
         else:
-            # Fallback to global mimic_meta for backward compatibility
-            view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
-        
-        threshold_per_view = threshold_per_dx[target_dx][view]
+            # Fallback to mimic_meta if provided; otherwise default to 'PA'
+            try:
+                if mimic_meta is not None:
+                    view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
+                else:
+                    view = 'PA'
+            except Exception:
+                view = 'PA'
 
-        tolerance = map_tolerance_per_dx[f'{target_dx}_{view}']['tolerance']
+        threshold_per_view = threshold_per_dx[target_dx].get(view, list(threshold_per_dx[target_dx].values())[0] if isinstance(threshold_per_dx[target_dx], dict) else threshold_per_dx[target_dx])
+
+        tolerance = map_tolerance_per_dx.get(f'{target_dx}_{view}', {}).get('tolerance', map_tolerance_per_dx.get(target_dx, {}).get('tolerance', 0.01))
 
         if label_measured > (threshold_per_view + tolerance):
             GT = '(a) Yes'
@@ -572,7 +877,11 @@ def mk_answer_q_dx(target_dx, dicom, label_measured):
             GT = '(b) No'
         else:
             GT = '(a) Yes, (b) No'
-    return GT
+    # Ensure GT always defined
+    try:
+        return GT
+    except Exception:
+        return "(c) I don't know"
 
 def get_option(number, distractor):
     def get_ordinal(n):
@@ -596,9 +905,27 @@ def get_option(number, distractor):
     result.append(f"({chr(97 + (number-1))}) {distractor}")
     return ', '.join(result)
 
+
+def safe_sample(population, k):
+    """Safely sample k items from population (list/set). If k <= 0 return [].
+    If k > len(population) return a shuffled copy of the whole population (length limited).
+    """
+    pop_list = list(population)
+    if k <= 0:
+        return []
+    if len(pop_list) == 0:
+        return []
+    k = min(k, len(pop_list))
+    return random.sample(pop_list, k)
+
 def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_options):
+    # Guard: if segmask base dir is missing or invalid, signal caller to skip immediately
+    if not segmask_base_dir or not os.path.isdir(segmask_base_dir):
+        return None, None, None
+
     target_dx_bodypart_path_lst = glob(f'{segmask_base_dir}/{target_dx}/*/{dicom}.png')
     target_dx_bodypart = [bodypart.split('/')[-2] for bodypart in target_dx_bodypart_path_lst]
+    has_target_bodypart = len(target_dx_bodypart_path_lst) > 0
 
     available_bodypart_path = []
     available_bodypart_lst = []
@@ -618,24 +945,35 @@ def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_optio
                     available_bodypart_lst.append(bodypart)
 
     if pitfall in ['basic']:
-        random_bodypart_path = random.sample(available_bodypart_path, (num_options - len(target_dx_bodypart) - 1))
+        # assemble candidate list (target bodyparts first, then other available bodyparts)
+        bodypart_candidates = list(target_dx_bodypart_path_lst) + list(available_bodypart_path)
+        if len(bodypart_candidates) == 0:
+            # No segmask images available for this dicom — signal caller to skip generating this QA
+            return None, None, None
+
+        random_bodypart_path = safe_sample(available_bodypart_path, (num_options - len(target_dx_bodypart) - 1))
         options = get_option(num_options, 'None of the above')
         bodypart_path_lst = target_dx_bodypart_path_lst + random_bodypart_path
         random.shuffle(bodypart_path_lst)
-        answer_lst = []
-        for target_dx_bodypart_path in target_dx_bodypart_path_lst:
-            answer_idx = bodypart_path_lst.index(target_dx_bodypart_path)
-            answer = options.split(', ')[answer_idx]
-            answer_lst.append(answer)
+        # If there are no correct target bodypart masks for this dicom,
+        # mark the answer as 'None of the above' (last option) instead of returning an empty string.
+        if not has_target_bodypart:
+            answer = options.split(', ')[-1]
+        else:
+            answer_lst = []
+            for target_dx_bodypart_path in target_dx_bodypart_path_lst:
+                answer_idx = bodypart_path_lst.index(target_dx_bodypart_path)
+                answer = options.split(', ')[answer_idx]
+                answer_lst.append(answer)
 
-        answer = ', '.join(sorted(answer_lst))
+            answer = ', '.join(sorted(answer_lst))
 
         bodypart_path_lst = [path.replace(segmask_base_dir, '') for path in bodypart_path_lst]
         return [options], [bodypart_path_lst], [answer]
 
     elif pitfall in ['two-round_none_included']:
         options_1st = get_option(num_options, 'Need new options')
-        bodypart_path_lst_1st = random.sample(available_bodypart_path, (num_options - 1))
+        bodypart_path_lst_1st = safe_sample(available_bodypart_path, (num_options - 1))
         random.shuffle(bodypart_path_lst_1st)
 
         options_list = options_1st.split(', ')
@@ -646,8 +984,8 @@ def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_optio
 
         available_bodypart_path_2nd = set(available_bodypart_path).difference(bodypart_path_lst_1st)
         options_2nd = get_option(num_options, 'None of the above')
-        bodypart_path_lst_2nd = random.sample(available_bodypart_path_2nd,
-                                              (num_options - len(target_dx_bodypart) - 1))
+        bodypart_path_lst_2nd = safe_sample(available_bodypart_path_2nd,
+                              (num_options - len(target_dx_bodypart) - 1))
         bodypart_path_lst_2nd += target_dx_bodypart_path_lst
         random.shuffle(bodypart_path_lst_2nd)
 
@@ -657,7 +995,11 @@ def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_optio
             answer = options_2nd.split(', ')[answer_idx]
             answer_lst.append(answer)
 
-        answer_2nd = ', '.join(sorted(answer_lst))
+        # If no target bodyparts exist for the second round, choose 'None of the above'
+        if not has_target_bodypart:
+            answer_2nd = options_2nd.split(', ')[-1]
+        else:
+            answer_2nd = ', '.join(sorted(answer_lst))
 
         bodypart_path_lst_1st = [path.replace(segmask_base_dir, '') for path in bodypart_path_lst_1st]
         bodypart_path_lst_2nd = [path.replace(segmask_base_dir, '') for path in bodypart_path_lst_2nd]
@@ -668,7 +1010,7 @@ def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_optio
         idx_partial = len(target_dx_bodypart_path_lst) // 2
 
         options_1st = get_option(num_options, 'Need new options')
-        bodypart_path_lst_1st = random.sample(available_bodypart_path, (num_options - len(target_dx_bodypart_path_lst[:idx_partial]) - 1))
+        bodypart_path_lst_1st = safe_sample(available_bodypart_path, (num_options - len(target_dx_bodypart_path_lst[:idx_partial]) - 1))
         bodypart_path_lst_1st += target_dx_bodypart_path_lst[:idx_partial]
         random.shuffle(bodypart_path_lst_1st)
 
@@ -690,8 +1032,8 @@ def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_optio
 
         options_2nd = get_option(num_options, 'None of the above')
 
-        bodypart_path_lst_2nd = random.sample(available_bodypart_path_2nd,
-                                              (num_options - len(target_dx_bodypart_path_lst[idx_partial:]) - 1))
+        bodypart_path_lst_2nd = safe_sample(available_bodypart_path_2nd,
+                              (num_options - len(target_dx_bodypart_path_lst[idx_partial:]) - 1))
         bodypart_path_lst_2nd += target_dx_bodypart_path_lst[idx_partial:]
         random.shuffle(bodypart_path_lst_2nd)
 
@@ -700,7 +1042,11 @@ def mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall, num_optio
             answer_idx = bodypart_path_lst_2nd.index(target_dx_bodypart_path)
             answer = options_2nd.split(', ')[answer_idx]
             answer_lst.append(answer)
-        answer_2nd = ', '.join(sorted(answer_lst))
+        # If there are no target bodyparts in the second half, choose 'None of the above'
+        if not has_target_bodypart:
+            answer_2nd = options_2nd.split(', ')[-1]
+        else:
+            answer_2nd = ', '.join(sorted(answer_lst))
 
         bodypart_path_lst_1st = [path.replace(segmask_base_dir, '') for path in bodypart_path_lst_1st]
         bodypart_path_lst_2nd = [path.replace(segmask_base_dir, '') for path in bodypart_path_lst_2nd]
@@ -711,17 +1057,25 @@ def mk_options_q_criteria(target_dx, criteria_selection_list, num_options, pitfa
     def mk_options(criteria_lst, target_criteria):
         options = ', '.join([f"({chr(97 + i)}) {criteria}" for i, criteria in enumerate(criteria_lst)])
         options_list = options.split('., ')
+        answer = None
 
         for option in options_list:
-            option = option + '.'
-            if target_criteria in option:
-                answer = option
+            opt = option + '.'
+            if target_criteria in opt:
+                answer = opt
+
+        if answer is None:
+            # fallback: choose the last option or a safe placeholder
+            if len(options_list) > 0:
+                answer = options_list[-1] + '.'
+            else:
+                answer = '(a) None of the above.'
 
         return options, answer
 
     if pitfall in ['two-round']:
         available_dx = list(set(criteria_selection_list.keys()) - set([target_dx]))
-        random_dx_1st = random.sample(available_dx, num_options - 1)
+        random_dx_1st = safe_sample(available_dx, max(0, num_options - 1))
         random_criteria_1st = [criteria_selection_list[key] for key in random_dx_1st]
         criteria_lst_1st = random_criteria_1st + ['Need new options']
 
@@ -729,9 +1083,9 @@ def mk_options_q_criteria(target_dx, criteria_selection_list, num_options, pitfa
 
 
         available_dx_2nd = list(set(criteria_selection_list.keys()) - set([target_dx] + random_dx_1st))
-        random_dx_2nd = random.sample(available_dx_2nd, num_options - 2)
-        random_criteria_2nd = [criteria_selection_list[key] for key in random_dx_2nd]
-        target_criteria = criteria_selection_list[target_dx]
+        random_dx_2nd = safe_sample(available_dx_2nd, max(0, num_options - 2))
+        random_criteria_2nd = [criteria_selection_list.get(key, 'Other') for key in random_dx_2nd]
+        target_criteria = criteria_selection_list.get(target_dx, 'Target criterion')
 
         criteria_lst_2nd = [target_criteria] + random_criteria_2nd
         random.shuffle(criteria_lst_2nd)
@@ -745,10 +1099,10 @@ def mk_options_q_criteria(target_dx, criteria_selection_list, num_options, pitfa
 
     elif pitfall in ['basic']:
         available_dx = list(set(criteria_selection_list.keys()) - set([target_dx]))
-        random_dx = random.sample(available_dx, (num_options-2))
+        random_dx = safe_sample(available_dx, max(0, (num_options-2)))
 
-        random_criteria = [criteria_selection_list[key] for key in random_dx]
-        target_criteria = criteria_selection_list[target_dx]
+        random_criteria = [criteria_selection_list.get(key, 'Other') for key in random_dx]
+        target_criteria = criteria_selection_list.get(target_dx, 'Target criterion')
 
         criteria_lst = [target_criteria] + random_criteria
         random.shuffle(criteria_lst)
@@ -756,14 +1110,18 @@ def mk_options_q_criteria(target_dx, criteria_selection_list, num_options, pitfa
 
         options = ', '.join([f"({chr(97+i)}) {criteria}" for i, criteria in enumerate(criteria_lst)])
         options_list = options.split('., ')
+        answer = None
 
         for option in options_list:
-            option = option + '.'
-            if target_criteria in option:
-                answer = option
+            opt = option + '.'
+            if target_criteria in opt:
+                answer = opt
+
+        if answer is None:
+            answer = options_list[-1] + '.' if options_list else '(a) None of the above.'
         return [options], [answer]
 
-def mk_options_q_measurement(target_dx, dicom, label_measured, num_options):
+def mk_options_q_measurement(target_dx, dicom, label_measured, num_options, mimic_meta=None):
     if target_dx in ['inclusion']:
         map_label_measured2answer = {
             'apex_both_in': 'Right apex: Included, Left apex: Included',
@@ -788,22 +1146,40 @@ def mk_options_q_measurement(target_dx, dicom, label_measured, num_options):
 
             # Create a list of possible values for each prefix
             possible_values = defaultdict(list)
-            for label_measured in map_label_measured2answer.keys():
-                position = label_measured.split('_')[0]
-                possible_values[f'{position}_'].append(label_measured)
+            for key in map_label_measured2answer.keys():
+                parts = key.split('_')
+                if len(parts) > 0:
+                    position = parts[0]
+                    possible_values[f'{position}_'].append(key)
 
+            # If any prefix group is empty, fallback to returning repeated input_list variants
+            if any(len(possible_values[prefix]) == 0 for prefix in ['apex_', 'side_', 'bottom_']):
+                # build simple variations
+                variations = []
+                for _ in range(max(0, num_samples - 1)):
+                    variations.append(list(input_list))
+                return variations
 
             # To store the unique lists
             unique_lists = set()
 
             # Keep generating until we have the required number of unique lists
-            while len(unique_lists) < num_samples:
+            attempts = 0
+            while len(unique_lists) < num_samples and attempts < 200:
+                attempts += 1
                 # Randomly select one value from each prefix group
-                new_list = [random.choice(possible_values[prefix]) for prefix in prefixes]
+                try:
+                    new_list = [random.choice(possible_values[prefix]) for prefix in prefixes]
+                except Exception:
+                    continue
 
                 # Ensure the generated list is not the same as the input list
                 if new_list != input_list:
                     unique_lists.add(tuple(new_list))  # Store as a tuple since lists are not hashable
+
+            # If we couldn't reach required unique lists, pad with copies
+            while len(unique_lists) < num_samples:
+                unique_lists.add(tuple(input_list))
 
             # Convert the sets back to lists
             return [list(unique_list) for unique_list in unique_lists]
@@ -872,11 +1248,22 @@ def mk_options_q_measurement(target_dx, dicom, label_measured, num_options):
         option_lst = list(map_measured2label.values())
         random.shuffle(option_lst)
 
+        # default label mapping
+        mapped_label = map_measured2label.get(label_measured, None)
+
         options = ''
+        answer = None
         for i, option in enumerate(option_lst):
             options += f"({chr(97+i)}) {option}, "
-            if option == map_measured2label[label_measured]:
+            if mapped_label is not None and option == mapped_label:
                 answer = f"({chr(97+i)}) {option}"
+
+        if answer is None:
+            # fallback to first option
+            if option_lst:
+                answer = f"(a) {option_lst[0]}"
+            else:
+                answer = '(a) Not available'
 
         return options, answer
 
@@ -990,7 +1377,21 @@ def mk_options_q_measurement(target_dx, dicom, label_measured, num_options):
 
                 return choices_[start_idx:end_idx], choices_[target_index]
 
-        view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
+        # Determine view position robustly: prefer dataset config (NIH), otherwise mimic_meta
+        config = get_dataset_config()
+        if config and getattr(config, 'dataset_name', None) == 'nih-cxr14':
+            try:
+                view = config.get_view_position(dicom, target_dx)
+            except Exception:
+                view = 'PA'
+        else:
+            try:
+                if mimic_meta is not None:
+                    view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
+                else:
+                    view = 'PA'
+            except Exception:
+                view = 'PA'
         key_dx = f"{target_dx}_{view}" if target_dx in ['cardiomegaly', 'mediastinal_widening'] else target_dx
         tolerance = map_tolerance_per_dx[key_dx]['tolerance']
         min_limit = map_tolerance_per_dx[key_dx]['min_limit']
@@ -1037,14 +1438,193 @@ def return_cxr_path(mimic_meta, dicom, dataset_name='mimic-cxr-jpg'):
         pid = mimic_meta[mimic_meta['dicom_id'] == dicom]['subject_id'].values[0]
         return f'p{str(pid)[:2]}/p{pid}/s{sid}/{dicom}.jpg'
 
+
+def cxr_file_exists(path_or_dicom, mimic_meta=None):
+    """Check whether a CXR file exists. Accepts either a returned path (e.g., '00000001_000.png')
+    or a dicom id. Performs several heuristic checks including repo dataset folder and
+    configured nih_image_base_dir when available via DatasetConfig.
+    """
+    # If it's an absolute path, check directly
+    try_paths = []
+    if os.path.isabs(path_or_dicom):
+        try_paths.append(path_or_dicom)
+    # If it looks like a filename (contains dot), treat as filename; otherwise treat as dicom id
+    filename = path_or_dicom if '.' in path_or_dicom else f"{path_or_dicom}.png"
+
+    # check config-provided base dir
+    config = get_dataset_config()
+    if config and hasattr(config, 'args'):
+        base = getattr(config.args, 'nih_image_base_dir', None)
+        if base:
+            try_paths.append(os.path.join(base, filename))
+
+    # repo dataset folder - search recursively to find file under any images_00x subfolder
+    repo_dataset = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'dataset'))
+    for p in try_paths:
+        try:
+            if p and os.path.exists(p):
+                return True
+        except Exception:
+            continue
+
+    # recursive search under dataset folder for the filename
+    if os.path.isdir(repo_dataset):
+        for root, dirs, files in os.walk(repo_dataset):
+            if filename in files:
+                return True
+
+
+    # lastly, check the raw input (maybe caller already passed a relative path)
+    try:
+        if path_or_dicom and os.path.exists(path_or_dicom):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _validate_and_write_qa(qa_dict, save_dir_stage, dicom):
+    """Validate qa_dict before writing. If validation fails, do not write and log skip reason.
+
+    Validation rules:
+    - `answer` must be a non-empty list with at least one non-blank string entry.
+    - if `img_path` present: must be non-empty list; all referenced image paths must exist (via `cxr_file_exists`).
+    Returns True if file was written, False if skipped.
+    """
+    os.makedirs(save_dir_stage, exist_ok=True)
+    reasons = []
+
+    # answer checks: accept string, number, or list of strings
+    ans = qa_dict.get('answer')
+    if ans is None:
+        reasons.append('missing_answer')
+    else:
+        if isinstance(ans, str):
+            if not ans.strip():
+                reasons.append('blank_answer')
+        elif isinstance(ans, list):
+            if len(ans) == 0:
+                reasons.append('empty_answer')
+            else:
+                if all((not (isinstance(a, str) and a.strip())) for a in ans):
+                    reasons.append('blank_answer')
+        else:
+            # allow numeric or other simple answer types as long as their string repr is non-empty
+            try:
+                if str(ans).strip() == '':
+                    reasons.append('blank_answer')
+            except Exception:
+                pass
+
+    # img_path checks
+    img_path = qa_dict.get('img_path')
+    missing_images = []
+    # Try to load a prebuilt image index if available (save_base_dir/image_index.json)
+    image_index = {}
+    try:
+        cfg = get_dataset_config()
+        if cfg is not None and hasattr(cfg, 'args') and getattr(cfg.args, 'save_base_dir', None):
+            idx_path = os.path.join(cfg.args.save_base_dir, 'image_index.json')
+            if os.path.isfile(idx_path):
+                try:
+                    with open(idx_path, 'r', encoding='utf-8') as _f:
+                        image_index = json.load(_f)
+                except Exception:
+                    image_index = {}
+    except Exception:
+        image_index = {}
+
+    if img_path is not None:
+        if not isinstance(img_path, list) or len(img_path) == 0:
+            reasons.append('empty_img_path')
+        else:
+            # flatten nested lists
+            for item in img_path:
+                entries = item if isinstance(item, list) else [item]
+                for rel in entries:
+                    if not isinstance(rel, str) or not rel.strip():
+                        missing_images.append({'path': rel, 'reason': 'empty_string'})
+                        continue
+                    # If absolute path or looks absolute, check directly
+                    if os.path.isabs(rel) and os.path.isfile(rel):
+                        continue
+                    # If contains a slash, try resolving relative to save_base_dir (common pattern '/<dx>/<file>.png')
+                    if '/' in rel:
+                        # try save_base_dir root lookup via dataset config
+                        try:
+                            cfg = get_dataset_config()
+                            if cfg is not None and hasattr(cfg, 'args') and getattr(cfg.args, 'save_base_dir', None):
+                                base = cfg.args.save_base_dir
+                                cand = os.path.join(base, rel.lstrip('/\\'))
+                                if os.path.isfile(cand):
+                                    continue
+                        except Exception:
+                            pass
+                        # fallback: check image_index by basename
+                        basename = os.path.splitext(os.path.basename(rel))[0]
+                        if basename in image_index and image_index[basename]:
+                            continue
+                        missing_images.append({'path': rel, 'reason': 'not_found', 'basename': basename})
+                        continue
+                    # no slash: treat as simple filename or basename; check index then cxr_file_exists
+                    rel_stripped = rel.lstrip('/')
+                    basename = os.path.splitext(os.path.basename(rel_stripped))[0]
+                    if basename in image_index and image_index[basename]:
+                        continue
+                    if not cxr_file_exists(rel_stripped):
+                        missing_images.append({'path': rel, 'reason': 'not_found', 'basename': basename})
+    if missing_images:
+        reasons.append({'missing_images': missing_images})
+
+    # If any reasons recorded, log and skip
+    if reasons:
+        log_path = os.path.join(save_dir_stage, '..', 'skipped_qa.log')
+        try:
+            with open(log_path, 'a', encoding='utf-8') as lf:
+                lf.write(json.dumps({'dicom': dicom, 'save_dir': save_dir_stage, 'reasons': reasons}, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        return False
+
+    # write file
+    try:
+        with open(os.path.join(save_dir_stage, f"{dicom}.json"), 'w', encoding='utf-8') as file:
+            json.dump(qa_dict, file, indent=4, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
 def qa_init_question(stage, dicom, target_dx, measured_value, mimic_meta, save_dir_gold_qa):
     cxr_path_lst = [return_cxr_path(mimic_meta, dicom)]
+
+    # Verify image exists before creating QA JSON to avoid generating "phantom" QA
+    # If the image is missing, skip writing and return None so callers can handle skipping.
+    missing = False
+    for p in cxr_path_lst:
+        if not cxr_file_exists(p, mimic_meta=mimic_meta):
+            missing = True
+            break
+    if missing:
+        print(f"Skipping QA for {dicom}: image file not found (checked {cxr_path_lst})")
+        return None
 
     guidance_init_q = "Please base your decision on the most established and clearly defined diagnostic criterion " \
                       "used in standard radiologic references. Avoid relying on indirect factors, " \
                       "which, while potentially relevant, are not the direct and primary criteria. " \
                       "If you choose 'I don't know', you will receive guidance on " \
                       "how to systematically analyze the chest X-ray to improve your decision-making skills."
+
+    # Get demographics (gender, age) if available and include them at the start of the question
+    gender, age = get_demographics(dicom, mimic_meta)
+    demographic_prefix = ''
+    if gender or age:
+        parts = []
+        if gender:
+            parts.append(f"Gender: {gender}")
+        if age:
+            parts.append(f"Age: {age}")
+        demographic_prefix = "Patient demographics — " + ", ".join(parts) + ". "
 
     # Get view position using dataset config
     config = get_dataset_config()
@@ -1058,90 +1638,145 @@ def qa_init_question(stage, dicom, target_dx, measured_value, mimic_meta, save_d
         else:
             view_ = 'PA (Posteroanterior)'
 
-        question_init_dx = f"{guidance_init_q} {initial_question_per_dx[target_dx]} The chest X-ray was taken in the {view_} view."
+        question_init_dx = f"{demographic_prefix}{guidance_init_q} {initial_question_per_dx[target_dx]} The chest X-ray was taken in the {view_} view."
     else:
-        question_init_dx = f"{guidance_init_q} {initial_question_per_dx[target_dx]}"
+        question_init_dx = f"{demographic_prefix}{guidance_init_q} {initial_question_per_dx[target_dx]}"
 
     answer_dx = mk_answer_q_dx(target_dx, dicom, measured_value)
 
     qa_dict = {'question': question_init_dx,
                'answer': answer_dx,
-               'img_path': cxr_path_lst}
+               'img_path': cxr_path_lst,
+               'demographics': {'gender': gender, 'age': age}}
     # # 'measured_value': measured_value,
     # 'dicom': dicom,
     #                'dx': target_dx,
     #                'inference_type': 'reasoning',
     #                'stage': 'init',
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
-
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'init', 'basic')
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing init QA for {dicom} due to validation failure")
+        return None
     return answer_dx
 
 def qa_criteria(stage, dicom, target_dx, num_options, pitfall, save_dir_gold_qa):
-    # ====================================================================
-    #                       Question - Criteria
-    # ====================================================================
-    options_criteria, answers_criteria = mk_options_q_criteria(target_dx, criteria_per_dx, num_options, pitfall)
-    questions_criteria = []
-    for idx, options_criteria_per_round in enumerate(options_criteria):
-        if idx != len(options_criteria) - 1:
-            question_criteria = "What criterion was used to make the decision for the first question? " \
-                                f"Options: {options_criteria_per_round}. " \
-                                f"If none of the options reflect a correct and " \
-                                f"direct criterion, select 'Need new options.'." \
-                                f"Do not choose an option just because it appears similar or somewhat related. " \
-                                f"If you select 'Need new options.', additional options will be provided."
-        else:
-            question_criteria = f"What criterion was used to make the decision for the first question? " \
-                                f"Options: {options_criteria_per_round}. " \
-                                f"If none of the options reflect a correct and " \
-                                f"direct criterion, select 'None of the above', and explain the criterion you applied."
+    try:
+        # Normalize potentially-None inputs to avoid passing None into os.path.join
+        pitfall_str = pitfall if pitfall is not None else 'none'
+        if save_dir_gold_qa is None:
+            save_dir_gold_qa = os.getcwd()
+        # ====================================================================
+        #                       Question - Criteria
+        # ====================================================================
+        # mk_options_q_criteria may return None to signal it cannot produce options
+        criteria_res = mk_options_q_criteria(target_dx, criteria_per_dx, num_options, pitfall)
+        if not criteria_res:
+            # Log and skip gracefully
+            log_path = os.path.join(save_dir_gold_qa, 'criteria', pitfall_str)
+            try:
+                os.makedirs(log_path, exist_ok=True)
+                with open(os.path.join(log_path, 'skipped_qa.log'), 'a', encoding='utf-8') as lf:
+                    lf.write(json.dumps({'dicom': dicom, 'stage': 'criteria', 'error': 'mk_options_q_criteria returned None'}, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            print(f"Skipped criteria QA for {dicom} due to no candidate options available")
+            return None
+        options_criteria, answers_criteria = criteria_res
+        questions_criteria = []
+        for idx, options_criteria_per_round in enumerate(options_criteria):
+            if idx != len(options_criteria) - 1:
+                question_criteria = "What criterion was used to make the decision for the first question? " \
+                                    f"Options: {options_criteria_per_round}. " \
+                                    f"If none of the options reflect a correct and " \
+                                    f"direct criterion, select 'Need new options.'." \
+                                    f"Do not choose an option just because it appears similar or somewhat related. " \
+                                    f"If you select 'Need new options.', additional options will be provided."
+            else:
+                question_criteria = f"What criterion was used to make the decision for the first question? " \
+                                    f"Options: {options_criteria_per_round}. " \
+                                    f"If none of the options reflect a correct and " \
+                                    f"direct criterion, select 'None of the above', and explain the criterion you applied."
 
-        questions_criteria.append(question_criteria)
+            questions_criteria.append(question_criteria)
 
-    qa_dict = {
-               'question': questions_criteria,
+        qa_dict = {
+                   'question': questions_criteria,
 
-               'answer': answers_criteria}
+                   'answer': answers_criteria}
+    except Exception as e:
+        log_path = os.path.join(save_dir_gold_qa, 'criteria', pitfall_str)
+        try:
+            os.makedirs(log_path, exist_ok=True)
+            with open(os.path.join(log_path, 'skipped_qa.log'), 'a', encoding='utf-8') as lf:
+                lf.write(json.dumps({'dicom': dicom, 'stage': 'criteria', 'error': str(e)}, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        print(f"Skipped criteria QA for {dicom} due to error: {e}")
+        return None
     # 'dicom': dicom,
     #                'dx': target_dx,
     #                'inference_type': 'reasoning',
     #                'stage': 'criteria',
     # 'option': options_criteria,
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/{pitfall}"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'criteria', pitfall_str)
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing criteria QA for {dicom} ({pitfall}) due to validation failure")
 
 def qa_custom_criteria(stage, dicom, target_dx, save_dir_gold_qa):
-    answer_refined_criteria = "(a) Yes"
-    question_refined_criteria = f"{refined_criteria_per_dx[target_dx]} " \
-                                f"Options: (a) Yes (b) No. " \
-                                f"If you choose '(b) No', you will receive guidance on " \
-                                f"how to systematically analyze the chest X-ray to improve your decision-making skills. " \
-                                f"Do not include any explanations."
+    try:
+        answer_refined_criteria = "(a) Yes"
+        question_refined_criteria = f"{refined_criteria_per_dx[target_dx]} " \
+                                    f"Options: (a) Yes (b) No. " \
+                                    f"If you choose '(b) No', you will receive guidance on " \
+                                    f"how to systematically analyze the chest X-ray to improve your decision-making skills. " \
+                                    f"Do not include any explanations."
 
-    qa_dict = {
-               'question': question_refined_criteria,
-               'answer': answer_refined_criteria}
+        qa_dict = {
+                   'question': question_refined_criteria,
+                   'answer': answer_refined_criteria}
+    except Exception as e:
+        log_path = os.path.join(save_dir_gold_qa, 'custom_criteria', 'basic')
+        try:
+            os.makedirs(log_path, exist_ok=True)
+            with open(os.path.join(log_path, 'skipped_qa.log'), 'a', encoding='utf-8') as lf:
+                lf.write(json.dumps({'dicom': dicom, 'stage': 'custom_criteria', 'error': str(e)}, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        print(f"Skipped custom_criteria QA for {dicom} due to error: {e}")
+        return None
 
     # 'dicom': dicom,
     #                'dx': target_dx,
     #                'inference_type': 'reasoning',
     #                'stage': 'custom_criteria',
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'custom_criteria', 'basic')
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing custom_criteria QA for {dicom} due to validation failure")
 
 def qa_bodypart(stage, inference_type, dicom, target_dx, num_options, pitfall, segmask_base_dir, save_dir_gold_qa):
-    options_bodypart_lst, img_path_lst_bodypart_lst, answer_bodypart_lst = \
-        mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall=pitfall, num_options=num_options)
+    # Normalize inputs
+    pitfall_str = pitfall if pitfall is not None else 'none'
+    if save_dir_gold_qa is None:
+        save_dir_gold_qa = os.getcwd()
+
+    try:
+        res = mk_options_q_bodypart(target_dx, dicom, segmask_base_dir, pitfall=pitfall, num_options=num_options)
+    except Exception as e:
+        print(f"Error generating bodypart options for {dicom} ({target_dx}): {e}")
+        return None
+
+    # If mk_options_q_bodypart signals no available segmask images, skip writing bodypart QA
+    if not res or (isinstance(res, (list, tuple)) and all(x is None for x in res)):
+        print(f"Skipping bodypart QA for {dicom} ({target_dx}): no segmask images available")
+        return None
+
+    options_bodypart_lst, img_path_lst_bodypart_lst, answer_bodypart_lst = res
 
     dx_multi_bodyparts = ['inspiration', 'rotation', 'projection', 'cardiomegaly', 'trachea_deviation',
                          'mediastinal_widening', 'aortic_knob_enlargement', 'ascending_aorta_enlargement', 'descending_aorta_enlargement',]
@@ -1208,48 +1843,78 @@ def qa_bodypart(stage, inference_type, dicom, target_dx, num_options, pitfall, s
     #                'stage': 'bodypart',
     # 'option': options_bodypart_lst,
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/{pitfall}"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'bodypart', pitfall_str)
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing bodypart QA for {dicom} ({pitfall}) due to validation failure")
 
 def qa_measurement(stage, inference_type, dicom, target_dx, measured_value, num_options, save_dir_gold_qa):
-    option, answer_measurement = mk_options_q_measurement(target_dx, dicom, measured_value, num_options=num_options)
+    try:
+        option, answer_measurement = mk_options_q_measurement(target_dx, dicom, measured_value, num_options=num_options)
 
-    question_measurement = measurement_q_per_dx[target_dx]['Simple'] + " " + option
+        question_measurement = measurement_q_per_dx[target_dx]['Simple'] + " " + option
 
-    qa_dict = {
-               'question': question_measurement,
-               'option': option,
-               'answer': answer_measurement}
+        qa_dict = {
+                   'question': question_measurement,
+                   'option': option,
+                   'answer': answer_measurement}
+    except Exception as e:
+        log_path = os.path.join(save_dir_gold_qa, 'measurement', 'basic')
+        try:
+            os.makedirs(log_path, exist_ok=True)
+            with open(os.path.join(log_path, 'skipped_qa.log'), 'a', encoding='utf-8') as lf:
+                lf.write(json.dumps({'dicom': dicom, 'stage': 'measurement', 'error': str(e)}, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        print(f"Skipped measurement QA for {dicom} due to error: {e}")
+        return None
     # 'dicom': dicom,
     #                'dx': target_dx,
     #                'measured_value': measured_value,
     #                'inference_type': inference_type,
     #                'stage': 'measurement',
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'measurement', 'basic')
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing measurement QA for {dicom} due to validation failure")
 
 def qa_final(stage, dicom, target_dx, measured_value, answer_init, save_dir_gold_qa):
-    question_final_dx = final_question_per_dx[target_dx]
+    try:
+        question_final_dx = final_question_per_dx[target_dx]
+        # Some final questions require also reporting the numeric measured value(s).
+        value_part = format_measured_value_part(target_dx, measured_value)
 
-    qa_dict = {
-               'question': question_final_dx,
-               'answer': answer_init
-               }
+        final_answer = answer_init
+        if isinstance(final_answer, str):
+            final_answer = final_answer + value_part
+        else:
+            try:
+                final_answer = str(final_answer) + value_part
+            except Exception:
+                final_answer = answer_init
+
+        qa_dict = {'question': question_final_dx, 'answer': final_answer}
+    except Exception as e:
+        save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'final', 'basic')
+        try:
+            os.makedirs(save_dir_gold_qa_stage, exist_ok=True)
+            with open(os.path.join(save_dir_gold_qa_stage, 'skipped_qa.log'), 'a', encoding='utf-8') as lf:
+                lf.write(json.dumps({'dicom': dicom, 'stage': 'final', 'error': str(e)}, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        print(f"Skipped final QA for {dicom} due to error: {e}")
+        return None
     # 'dicom': dicom,
     #                'dx': target_dx,
     #                'measured_value': measured_value,
     #                'inference_type': 'reasoning',
     #                'stage': 'final',
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'final', 'basic')
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing final QA for {dicom} due to validation failure")
 
 
 map_bodypart_fname2real = {
@@ -1401,6 +2066,10 @@ measurement_instruction_per_dx = {
 }
 
 def mk_qa_guidance_bodypart(target_dx, dicom, segmask_base_dir, num_options):
+    # Guard: avoid expensive glob when segmask base dir missing or invalid
+    if not segmask_base_dir or not os.path.isdir(segmask_base_dir):
+        return None, None, None, None
+
     target_dx_bodypart_path_lst = glob(f'{segmask_base_dir}/{target_dx}/*/{dicom}.png')
     target_dx_bodypart = [bodypart.split('/')[-2] for bodypart in target_dx_bodypart_path_lst]
 
@@ -1415,28 +2084,38 @@ def mk_qa_guidance_bodypart(target_dx, dicom, segmask_base_dir, num_options):
                 available_bodypart_path.append(path)
                 available_bodypart_lst.append(bodypart)
 
-    random_bodypart_path = random.sample(available_bodypart_path, (num_options - len(target_dx_bodypart) - 1))
+    random_bodypart_path = safe_sample(available_bodypart_path, (num_options - len(target_dx_bodypart) - 1))
     options = get_option(num_options, 'None of the above')
-    bodypart_path_lst = target_dx_bodypart_path_lst + random_bodypart_path
+    bodypart_path_lst = list(target_dx_bodypart_path_lst) + list(random_bodypart_path)
     random.shuffle(bodypart_path_lst)
+
+    # If no segmask images at all for this dicom, signal caller to skip
+    if len(bodypart_path_lst) == 0:
+        return None, None, None, None
+
     question_lst, answer_lst = [], []
     for idx, bodypart_path in enumerate(bodypart_path_lst):
         if bodypart_path in target_dx_bodypart_path_lst:
             bodypart_name = bodypart_path.split('/')[-2]
-            bodypart_placeholder = map_bodypart_fname2real[bodypart_name]
+            bodypart_placeholder = map_bodypart_fname2real.get(bodypart_name, bodypart_name)
 
             if len(question_lst) == 0:
-                question = 'Among the following images, each image either contains a segmentation mask ' \
-                           'highlighting a specific body part or a reference line necessary for decision. ' \
-                           f'Which image represents {bodypart_placeholder.lower()}?  Options: {options}.'
+                question = (f"Among the following images, each image either contains a segmentation mask "
+                            f"highlighting a specific body part or a reference line necessary for decision. "
+                            f"Which image represents {bodypart_placeholder.lower()}?  Options: {options}.")
             else:
-                question = f"Continuing from the previous question, " \
-                           f"which image corresponds to {bodypart_placeholder.lower()}?  Options: {options}."
+                question = f"Continuing from the previous question, which image corresponds to {bodypart_placeholder.lower()}?  Options: {options}."
 
             question_lst.append(question)
-
             answer = options.split(', ')[idx]
             answer_lst.append(answer)
+
+    # If none of the presented images are target bodyparts (i.e., target_dx has no masks),
+    # produce a single question with answer 'None of the above' (last option) instead of empty lists.
+    if len(question_lst) == 0:
+        single_question = 'Among the following images, each image either contains a segmentation mask highlighting a specific body part or a reference line necessary for decision. If none of the images show the required body part, select "None of the above".'
+        question_lst = [single_question]
+        answer_lst = [options.split(', ')[-1]]
 
     bodypart_path_lst = [path.replace(segmask_base_dir, '') for path in bodypart_path_lst]
     return question_lst, answer_lst, options, bodypart_path_lst
@@ -1456,16 +2135,36 @@ def qa_bodypart_guidance(stage, dicom, target_dx, segmask_base_dir, num_options,
     #                'stage': 'bodypart',
     # 'option': options_bodypart,
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    # Save guidance bodypart under 'bodypart/basic' for consistency with other pipelines
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'bodypart', 'basic')
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing bodypart guidance QA for {dicom} due to validation failure")
+    else:
+        # Also write a copy under legacy stage name 'stage1/basic' for tools expecting stage1
+        try:
+            stage1_dir = os.path.join(save_dir_gold_qa, 'stage1', 'basic')
+            _validate_and_write_qa(qa_dict, stage1_dir, dicom)
+        except Exception:
+            pass
 
 def qa_measurement_guidance(stage, dicom, target_dx, pnt_on_cxr_base_dir, measured_value, num_options, save_dir_gold_qa):
     options_measurement, answer_measurement = mk_options_q_measurement(target_dx, dicom, measured_value, num_options)
 
     question_measurement = measurement_instruction_per_dx[target_dx] + " " + options_measurement
-    img_path_lst = [f"/{target_dx}/{dicom}.png"]
+    # Prefer using point-on-CXR visualization if available
+    img_path_lst = []
+    try:
+        if pnt_on_cxr_base_dir:
+            candidate = os.path.join(pnt_on_cxr_base_dir, target_dx, f"{dicom}.png")
+            if os.path.exists(candidate):
+                # store relative path by stripping base dir for consistency with other QA img paths
+                img_path_lst = [candidate.replace(pnt_on_cxr_base_dir, '')]
+    except Exception:
+        img_path_lst = []
+
+    if not img_path_lst:
+        img_path_lst = [f"/{target_dx}/{dicom}.png"]
 
     qa_dict = {
                'question': question_measurement,
@@ -1479,10 +2178,18 @@ def qa_measurement_guidance(stage, dicom, target_dx, pnt_on_cxr_base_dir, measur
     #                'measured_value': measured_value,
     # 'option': options_measurement,
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    # Save measurement guidance under 'measurement/basic' to match measurement stage naming
+    save_dir_gold_qa_stage = os.path.join(save_dir_gold_qa, 'measurement', 'basic')
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa_stage, dicom)
+    if not written:
+        print(f"Skipped writing measurement guidance QA for {dicom} due to validation failure")
+    else:
+        # Also write a copy under legacy stage name 'stage2/basic' for tools expecting stage2
+        try:
+            stage2_dir = os.path.join(save_dir_gold_qa, 'stage2', 'basic')
+            _validate_and_write_qa(qa_dict, stage2_dir, dicom)
+        except Exception:
+            pass
 
 prefix_final_q = "Based on the measurement results from the previous question"
 final_question_per_dx_guidance = {
@@ -1565,13 +2272,25 @@ final_question_per_dx_guidance = {
                                  "Do not include any explanations.",
 }
 
-def qa_final_guidance(stage, dicom, target_dx, measured_value, save_dir_gold_qa):
-    # Get view position using dataset config
+def qa_final_guidance(stage, dicom, target_dx, measured_value, save_dir_gold_qa, mimic_meta=None):
+    # Get view position using dataset config (preferred) or mimic_meta fallback
     config = get_dataset_config()
     if config:
-        view = config.get_view_position(dicom, target_dx)
+        try:
+            view = config.get_view_position(dicom, target_dx)
+        except Exception:
+            view = None
     else:
-        view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
+        view = None
+
+    if view is None:
+        if mimic_meta is not None and hasattr(mimic_meta, 'columns'):
+            try:
+                view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
+            except Exception:
+                view = 'PA'
+        else:
+            view = 'PA'
     
     question_final_dx = final_question_per_dx_guidance[target_dx]
     if target_dx in ['cardiomegaly', 'mediastinal_widening']:
@@ -1594,9 +2313,21 @@ def qa_final_guidance(stage, dicom, target_dx, measured_value, save_dir_gold_qa)
 
     answer_dx = mk_answer_q_dx(target_dx, dicom, measured_value)
 
+    # Append measured numeric value(s) to the final answer for measurement-type diagnostics
+    value_part = format_measured_value_part(target_dx, measured_value)
+
+    final_answer = answer_dx
+    try:
+        if isinstance(final_answer, str):
+            final_answer = final_answer + value_part
+        else:
+            final_answer = str(final_answer) + value_part
+    except Exception:
+        final_answer = answer_dx
+
     qa_dict = {
                'question': question_final_dx,
-               'answer': answer_dx
+               'answer': final_answer
                }
     # 'dicom': dicom,
     #                'dx': target_dx,
@@ -1604,20 +2335,36 @@ def qa_final_guidance(stage, dicom, target_dx, measured_value, save_dir_gold_qa)
     #                'inference_type': 'guidance',
     #                'stage': 'final',
     save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa, dicom)
+    if not written:
+        print(f"Skipped writing final guidance QA for {dicom} due to validation failure")
 
-def qa_init_after_guidance(stage, dicom, target_dx, measured_value, save_dir_gold_qa):
+def qa_init_after_guidance(stage, dicom, target_dx, measured_value, save_dir_gold_qa, mimic_meta=None):
+    # Prefer dataset config's mimic_meta if available
+    config = get_dataset_config()
+    cfg_meta = None
+    if config and getattr(config, 'mimic_meta', None) is not None:
+        cfg_meta = config.mimic_meta
 
-    cxr_path_lst = [return_cxr_path(mimic_meta, dicom)]
+    mm = cfg_meta if cfg_meta is not None else mimic_meta
+
+    cxr_path_lst = [return_cxr_path(mm, dicom)]
+
+    # avoid generating QA if image missing
+    for p in cxr_path_lst:
+        if not cxr_file_exists(p, mimic_meta=mm):
+            print(f"Skipping QA (after guidance) for {dicom}: image file not found (checked {cxr_path_lst})")
+            return None
 
     guidance_init_q = "With the understanding you've gained from the previous steps, " \
                       "answer the following question accordingly."
 
 
 
-    view = mimic_meta[mimic_meta['dicom_id'] == dicom]['ViewPosition'].values[0]
+    try:
+        view = mm[mm['dicom_id'] == dicom]['ViewPosition'].values[0]
+    except Exception:
+        view = 'PA'
     if target_dx in ['cardiomegaly', 'mediastinal_widening']:
         if view in ['AP']:
             view_ = 'AP (Anteroposterior)'
@@ -1642,9 +2389,9 @@ def qa_init_after_guidance(stage, dicom, target_dx, measured_value, save_dir_gol
     #                'stage': 'init',
 
     save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/basic"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa, dicom)
+    if not written:
+        print(f"Skipped writing init_after_guidance QA for {dicom} due to validation failure")
 
     return answer_dx
 
@@ -1691,6 +2438,10 @@ def qa_criteria_after_guidance(stage, dicom, target_dx, num_options, pitfall, sa
     # ====================================================================
     #                       Question - Criteria
     # ====================================================================
+    # Normalize inputs to avoid None in path joins
+    pitfall_str = pitfall if pitfall is not None else 'none'
+    if save_dir_gold_qa is None:
+        save_dir_gold_qa = os.getcwd()
     options_criteria, answers_criteria = mk_options_q_criteria(target_dx, criteria_per_dx_after_guidance,
                                                                num_options, pitfall)
     questions_criteria = []
@@ -1719,10 +2470,10 @@ def qa_criteria_after_guidance(stage, dicom, target_dx, num_options, pitfall, sa
     #                'stage': 'criteria',
     # 'option': options_criteria,
 
-    save_dir_gold_qa = f"{save_dir_gold_qa}/{stage}/{pitfall}"
-    os.makedirs(save_dir_gold_qa, exist_ok=True)
-    with open(f"{save_dir_gold_qa}/{dicom}.json", "w") as file:
-        json.dump(qa_dict, file, indent=4)
+    save_dir_gold_qa = os.path.join(save_dir_gold_qa, stage, pitfall_str)
+    written = _validate_and_write_qa(qa_dict, save_dir_gold_qa, dicom)
+    if not written:
+        print(f"Skipped writing criteria_after_guidance QA for {dicom} due to validation failure")
 
 def return_mc_format_list(args, dx):
     bodypart_num_per_dx = glob(f'{args.segmask_base_dir}/{dx}/*')
@@ -1759,7 +2510,69 @@ def return_measured_value(args, dicom, dx):
         'descending_aorta_enlargement': 'ratio', 'descending_aorta_tortuous': 'curvature',
     }
 
-    df_chexstruct = pd.read_csv(os.path.join(args.chexstruct_base_dir, f'{dx}.csv'))
+    csv_path = os.path.join(args.chexstruct_base_dir, f'{dx}.csv')
+    if not os.path.exists(csv_path):
+        # try common alternate locations where NIH CSVs may live
+        candidate_dirs = []
+        if getattr(args, 'cxreasonbench_base_dir', None):
+            candidate_dirs.append(os.path.join(args.cxreasonbench_base_dir, 'nih_cxr14'))
+            candidate_dirs.append(os.path.join(args.cxreasonbench_base_dir, 'nih-cxr14_viz'))
+            candidate_dirs.append(args.cxreasonbench_base_dir)
+        if getattr(args, 'save_base_dir', None):
+            candidate_dirs.append(os.path.join(args.save_base_dir, 'nih_cxr14'))
+            candidate_dirs.append(os.path.join(args.save_base_dir, 'nih-cxr14_viz'))
+        # repo-relative common locations
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        candidate_dirs.append(os.path.join(repo_root, 'nih_cxr14'))
+        candidate_dirs.append(os.path.join(repo_root, 'nih-cxr14_viz'))
+        candidate_dirs.append(os.path.join(repo_root, 'dataset'))
+
+        found = False
+        tried = [csv_path]
+        for d in candidate_dirs:
+            try_path = os.path.join(d, f'{dx}.csv')
+            tried.append(try_path)
+            if os.path.exists(try_path):
+                csv_path = try_path
+                found = True
+                try:
+                    print(f"[measure-info] using chexstruct CSV for {dx}: {csv_path}")
+                except Exception:
+                    pass
+                break
+        if not found:
+            raise FileNotFoundError(f"chexstruct CSV not found for {dx}; tried: {tried}")
+    try:
+        df_chexstruct = pd.read_csv(csv_path)
+    except Exception as e:
+        raise RuntimeError(f"failed to read chexstruct CSV {csv_path}: {e}")
+
+    # Helper to find a matching row for dicom with several fallbacks
+    def _find_row(df, dicom_id):
+        # direct match
+        try:
+            row = df[df['image_file'] == dicom_id]
+            if len(row) > 0:
+                return row.iloc[0]
+        except Exception:
+            pass
+        # try with png suffix
+        try:
+            png_name = f"{dicom_id}.png"
+            row = df[df['image_file'] == png_name]
+            if len(row) > 0:
+                return row.iloc[0]
+        except Exception:
+            pass
+        # try substring contains
+        try:
+            row = df[df['image_file'].astype(str).str.contains(str(dicom_id))]
+            if len(row) > 0:
+                return row.iloc[0]
+        except Exception:
+            pass
+        return None
+
     if dx in ['inclusion']:
         def get_lung_label(df, dicom, region):
 
@@ -1778,18 +2591,54 @@ def return_measured_value(args, dicom, dx):
             else:
                 return f'{region}_both_ex'
 
-        label_side = get_lung_label(df_chexstruct, dicom, 'side')
-        label_apex = get_lung_label(df_chexstruct, dicom, 'apex')
-        label_bottom = get_lung_label(df_chexstruct, dicom, 'bottom')
+        row = _find_row(df_chexstruct, dicom)
+        if row is None:
+            raise KeyError(f"dicom {dicom} not found in {csv_path}")
+
+        def get_lung_label_from_row(row, region):
+            right_col = f'label_{region}_right_lung'
+            left_col = f'label_{region}_left_lung'
+            try:
+                right = row[right_col]
+                left = row[left_col]
+            except Exception:
+                raise KeyError(f"expected columns {right_col}/{left_col} not in {csv_path}")
+            if right == 1 and left == 1:
+                return f'{region}_both_in'
+            elif right == 1 and left == 0:
+                return f'{region}_r_in_l_ex'
+            elif right == 0 and left == 1:
+                return f'{region}_r_ex_l_in'
+            else:
+                return f'{region}_both_ex'
+
+        label_side = get_lung_label_from_row(row, 'side')
+        label_apex = get_lung_label_from_row(row, 'apex')
+        label_bottom = get_lung_label_from_row(row, 'bottom')
 
         measured_value = [label_side, label_apex, label_bottom]
 
     elif dx in ['projection']:
-        measured_value_right = df_chexstruct[df_chexstruct['image_file'] == dicom]['ratio_right'].values[0]
-        measured_value_left = df_chexstruct[df_chexstruct['image_file'] == dicom]['ratio_left'].values[0]
+        row = _find_row(df_chexstruct, dicom)
+        if row is None:
+            raise KeyError(f"dicom {dicom} not found in {csv_path}")
+        try:
+            measured_value_right = row['ratio_right']
+            measured_value_left = row['ratio_left']
+        except Exception:
+            raise KeyError(f"expected projection columns not found in {csv_path}")
         measured_value = [measured_value_right, measured_value_left]
     else:
-        measured_value = df_chexstruct[df_chexstruct['image_file'] == dicom][dx_by_colname_measurement[dx]].values[0]
+        if dx not in dx_by_colname_measurement:
+            raise KeyError(f"no measurement column mapping for dx={dx}")
+        col = dx_by_colname_measurement[dx]
+        row = _find_row(df_chexstruct, dicom)
+        if row is None:
+            raise KeyError(f"dicom {dicom} not found in {csv_path}")
+        try:
+            measured_value = row[col]
+        except Exception:
+            raise KeyError(f"column {col} not found for dx {dx} in {csv_path}")
     return measured_value
 
 
@@ -1827,36 +2676,44 @@ if __name__ == '__main__':
 
     with open(args.dx_by_dicoms_file, "r") as file:
         dx_by_dicoms = json.load(file)
+    skip_counts = defaultdict(int)
 
     for dx, dicom_lst in dx_by_dicoms.items():
         save_dir_qa = os.path.join(args.save_base_dir, 'qa', dx, args.inference_path)
         mc_format_lst_criteria, mc_format_lst_bodypart = return_mc_format_list(args, dx)
-        for idx, dicom in tqdm(enumerate(dicom_lst), total=len(dicom_lst), desc=f'{args.inference_path}-{dx}'):
-            measured_value = return_measured_value(args, dicom, dx)
-            if args.inference_path in ['path1']:
-                random.seed(42)
 
-                answer_init = qa_init_question('init', dicom, dx, measured_value, mimic_meta, save_dir_qa)
-                qa_criteria('stage1', dicom, dx, args.num_options, mc_format_lst_criteria[idx], save_dir_qa)
-                if dx in refined_criteria_per_dx.keys():
-                    qa_custom_criteria('stage1.5', dicom, dx, save_dir_qa)
-                qa_bodypart('stage2', args.inference_path, dicom, dx, args.num_options, mc_format_lst_bodypart[idx], args.segmask_base_dir, save_dir_qa)
-                qa_measurement('stage3', args.inference_path, dicom, dx, measured_value, args.num_options, save_dir_qa)
-                qa_final('stage4', dicom, dx, measured_value, answer_init, save_dir_qa)
+        # Cache MC-format lists so worker processes can access them
+        _MC_FORMATS[dx] = (mc_format_lst_criteria, mc_format_lst_bodypart)
 
-            elif args.inference_path in ['path2']:
-                random.seed(33)
-                qa_bodypart_guidance('stage1', dicom, dx, args.segmask_base_dir, args.num_options, save_dir_qa)
-                qa_measurement_guidance('stage2', dicom, dx,  args.pnt_base_dir, measured_value, args.num_options, save_dir_qa)
-                qa_final_guidance('stage3', dicom, dx, measured_value, save_dir_qa)
+        tasks = [(dx, dicom, idx) for idx, dicom in enumerate(dicom_lst)]
 
-            elif args.inference_path in ['re-path1']:
-                random.seed(24)
-                answer_init = qa_init_after_guidance('init', dicom, dx, measured_value, save_dir_qa)
-                qa_criteria_after_guidance('stage1', dicom, dx, args.num_options, mc_format_lst_criteria[idx], save_dir_qa)
-                qa_bodypart('stage2', args.inference_path, dicom, dx, args.num_options, mc_format_lst_bodypart[idx], args.segmask_base_dir, save_dir_qa)
-                qa_measurement('stage3', args.inference_path, dicom, dx, measured_value, args.num_options, save_dir_qa)
-                qa_final('stage4', dicom, dx, measured_value, answer_init, save_dir_qa)
+        # Determine number of processes (don't spawn more than number of dicoms)
+        if getattr(args, 'workers', None) and isinstance(args.workers, int) and args.workers > 0:
+            desired_procs = args.workers
+        else:
+            desired_procs = (os.cpu_count() or 1)
+        n_procs = min(len(tasks), desired_procs)
+
+        if n_procs <= 1:
+            # Fallback to sequential processing for single-process case
+            for task in tqdm(tasks, total=len(tasks), desc=f'{args.inference_path}-{dx}'):
+                dx_r, dicom_r, status = _process_single_dicom(task)
+                if status != 'ok':
+                    skip_counts[dx] += 1
+        else:
+            # Use multiprocessing Pool with imap_unordered for progress reporting
+            with multiprocessing.Pool(processes=n_procs) as pool:
+                for dx_r, dicom_r, status in tqdm(pool.imap_unordered(_process_single_dicom, tasks), total=len(tasks), desc=f'{args.inference_path}-{dx}'):
+                    if status != 'ok':
+                        skip_counts[dx] += 1
+
+    # Print skip summary if any dicoms were skipped due to missing segmasks
+    total_skips = sum(skip_counts.values())
+    if total_skips > 0:
+        print('\nSummary: skipped QA generation due to missing segmask files:')
+        for k, v in skip_counts.items():
+            print(f'  {k}: {v}')
+        print(f'  total skipped: {total_skips}\n')
 
 
 

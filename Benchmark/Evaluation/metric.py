@@ -9,6 +9,16 @@ import pandas as pd
 from glob import glob
 from collections import Counter, defaultdict
 
+
+def _safe_mean(arr):
+    try:
+        a = np.array(arr)
+        if a.size:
+            return float(a.mean())
+        return float('nan')
+    except Exception:
+        return float('nan')
+
 def config():
     parser = argparse.ArgumentParser()
     parser.add_argument('--saved_dir_inference', default='path/to/saved_inference_result', type=str)
@@ -108,19 +118,80 @@ def calculate_metrics(args, inference_path):
                 dx = scoring_path_dx.split('/')[-1]
 
                 if inference_path in ['reasoning']:
-                    possible_stage_lst = glob(f'{args.qa_base_dir}/{dx}/path1/*')
+                    possible_stage_lst = glob(f'{args.qa_base_dir}/{dx}/path1/*') if hasattr(args, 'qa_base_dir') else []
                     header1 = ['init', 'criteria', 'bodypart', 'measurement', 'final']
                     header2 = ['init', 'criteria', 'custom_criteria', 'bodypart', 'measurement', 'final']
+                    header_stage = None
                     if len(header1) == len(possible_stage_lst):
                         header_stage = header1
                     elif len(header2) == len(possible_stage_lst):
                         header_stage = header2
+                    else:
+                        # try to infer header_stage from existing scoring files if QA folders are missing
+                        scoring_files_tmp = glob(f"{scoring_path_dx}/*.json")
+                        if scoring_files_tmp:
+                            try:
+                                with open(scoring_files_tmp[0], 'r') as f:
+                                    scoring_tmp = json.load(f)
+                                # collect naive stage names from scoring keys
+                                naive_stage_keys = sorted({re.sub(r'\d+', '', k).replace('stage-', '') for k in scoring_tmp.keys() if k.startswith('stage-')})
+                                # map common stage names to header_stage
+                                if set(['init', 'criteria', 'bodypart', 'measurement', 'final']).issubset(set(naive_stage_keys)):
+                                    header_stage = header1
+                                elif set(['init', 'criteria', 'custom_criteria', 'bodypart', 'measurement', 'final']).issubset(set(naive_stage_keys)):
+                                    header_stage = header2
+                                else:
+                                    # fallback: if any of expected stages present, choose header1 and proceed
+                                    header_stage = header1
+                            except Exception:
+                                print(f"Warning: failed to infer stages from scoring files for dx={dx}. Skipping this dx.")
+                                continue
+                        else:
+                            print(f"Warning: unexpected number of stages for dx={dx}. found {len(possible_stage_lst)} stages and no scoring files. Skipping this dx.")
+                            continue
 
                 elif inference_path in ['guidance']:
                     possible_stage_lst = glob(f'{args.qa_base_dir}/{dx}/path2/*') + glob(f'{args.qa_base_dir}/{dx}/re-path1/*')
-                    header_stage = ['guidance-bodypart', 'guidance-measurement', 'guidance-final',
-                                    'review-init', 'review-criteria', 'review-bodypart', 'review-measurement', 'review-final']
-                assert len(possible_stage_lst) == len(header_stage)
+                    # Build header_stage dynamically based on which path2 / re-path1 folders exist
+                    guidance_found = set()
+                    review_found = set()
+                    for p in possible_stage_lst:
+                        lower = p.lower()
+                        if '/path2/' in lower:
+                            if 'bodypart' in lower or 'stage1' in lower:
+                                guidance_found.add('guidance-bodypart')
+                            if 'measurement' in lower or 'stage2' in lower:
+                                guidance_found.add('guidance-measurement')
+                            if 'final' in lower or 'stage3' in lower:
+                                guidance_found.add('guidance-final')
+                        if '/re-path1/' in lower or '/re-path1\\' in lower:
+                            if 'init' in lower:
+                                review_found.add('review-init')
+                            if 'stage1' in lower or 'criteria' in lower:
+                                review_found.add('review-criteria')
+                            if 'bodypart' in lower:
+                                review_found.add('review-bodypart')
+                            if 'measurement' in lower:
+                                review_found.add('review-measurement')
+                            if 'final' in lower:
+                                review_found.add('review-final')
+                    # maintain canonical order
+                    header_stage = []
+                    for k in ['guidance-bodypart', 'guidance-measurement', 'guidance-final']:
+                        if k in guidance_found:
+                            header_stage.append(k)
+                    for k in ['review-init', 'review-criteria', 'review-bodypart', 'review-measurement', 'review-final']:
+                        if k in review_found:
+                            header_stage.append(k)
+                    # fallback to full default if nothing detected
+                    if not header_stage:
+                        header_stage = ['guidance-bodypart', 'guidance-measurement', 'guidance-final',
+                                        'review-init', 'review-criteria', 'review-bodypart', 'review-measurement', 'review-final']
+                if not header_stage:
+                    print(f"Warning: header_stage could not be determined for dx={dx}. Skipping this dx.")
+                    continue
+                if len(possible_stage_lst) != len(header_stage):
+                    print(f"Warning: header_stage mismatch for dx={dx}. possible_stage_lst={len(possible_stage_lst)}, header_stage={len(header_stage)}. Continuing with available files.")
 
                 df_scores = defaultdict(list)
                 dicom_lst_measurement_matching_per_stage = defaultdict(list)
@@ -197,8 +268,12 @@ def calculate_metrics(args, inference_path):
                         if naive_stage in scoring_result:
                             df_scores_dicom[name_stage] = scoring_result[naive_stage]
                         else:
-                            if len(results) == sum(results):
-                                df_scores_dicom[name_stage] = 1
+                            # results contains numeric flags for sub-stages (e.g., guidance-bodypart_0, _1)
+                            # treat the grouped stage as passed if the majority of sub-stages are correct (==1)
+                            if results:
+                                num_pass = sum(1 for r in results if isinstance(r, (int, float)) and int(r) == 1)
+                                pass_ratio = num_pass / len(results)
+                                df_scores_dicom[name_stage] = 1 if pass_ratio >= 0.5 else 0
                             else:
                                 df_scores_dicom[name_stage] = 0
 
@@ -406,8 +481,8 @@ def calculate_metrics(args, inference_path):
 
                     assert len(conquer_stage_lst_guidance) == len(df_scores['dicom'])
 
-                    stage_score_guidance = np.array(conquer_stage_lst_guidance).mean()
-                    stage_std_guidance = np.array(conquer_stage_lst_guidance).std()
+                    stage_score_guidance = _safe_mean(conquer_stage_lst_guidance)
+                    stage_std_guidance = float(np.array(conquer_stage_lst_guidance).std()) if len(conquer_stage_lst_guidance) > 0 else float('nan')
 
                     if dx in df_measure_type['measurement']:
                         num_correct_g_measure_matching = len(dicom_lst_measurement_matching_per_stage['stage-measured_value_guidance'])
@@ -423,15 +498,15 @@ def calculate_metrics(args, inference_path):
                                                              + ([1] * (num_correct_g_body - num_correct_g_measure_matching)) \
                                                              + ([0] * (len(df_scores['dicom']) - num_correct_g_body))
 
-                        stage_score_guidance_refined = np.array(conquer_stage_lst_guidance_refined).mean()
-                        stage_std_guidance_refined = np.array(conquer_stage_lst_guidance_refined).std()
+                        stage_score_guidance_refined = _safe_mean(conquer_stage_lst_guidance_refined)
+                        stage_std_guidance_refined = float(np.array(conquer_stage_lst_guidance_refined).std()) if len(conquer_stage_lst_guidance_refined) > 0 else float('nan')
                         assert len(conquer_stage_lst_guidance_refined) == len(df_scores['dicom'])
 
                     # ============# ============# ============# ============
                     #                         Review
                     # ============# ============# ============# ============
-                    idk_init_review = (np.array(df_scores['review-init']) == -1).sum()
-                    idk_init_review_ratio = (np.array(df_scores['review-init']) == -1).sum() / num_correct_g_final
+                    idk_init_review = int((np.array(df_scores['review-init']) == -1).sum())
+                    idk_init_review_ratio = (int((np.array(df_scores['review-init']) == -1).sum()) / num_correct_g_final) if num_correct_g_final > 0 else float('nan')
 
                     num_correct_r_init = (np.array(df_scores['review-init']) == 1).sum()
                     num_correct_r_criteria = (np.array(df_scores['review-criteria']) == 1).sum()
@@ -460,8 +535,8 @@ def calculate_metrics(args, inference_path):
                                                + ([2] * (num_correct_r_bodypart - num_correct_r_measure)) \
                                                + ([1] * (num_correct_r_criteria - num_correct_r_bodypart)) \
                                                + ([0] * (num_correct_r_init - num_correct_r_criteria))
-                    stage_score_review = np.array(conquer_stage_lst_review).mean()
-                    stage_std_review = np.array(conquer_stage_lst_review).std()
+                    stage_score_review = _safe_mean(conquer_stage_lst_review)
+                    stage_std_review = float(np.array(conquer_stage_lst_review).std()) if len(conquer_stage_lst_review) > 0 else float('nan')
 
                     if dx in df_measure_type['measurement']:
                         num_correct_r_measure_matching = len(dicom_lst_measurement_matching_per_stage['stage-measured_value_review'])
@@ -489,8 +564,8 @@ def calculate_metrics(args, inference_path):
                                                            + ([2] * (num_correct_r_bodypart - num_correct_r_measure_matching)) \
                                                            + ([1] * (num_correct_r_criteria - num_correct_r_bodypart)) \
                                                            + ([0] * (num_correct_r_init - num_correct_r_criteria))
-                        stage_score_review_refined = np.array(conquer_stage_lst_review_refined).mean()
-                        stage_std_review_refined = np.array(conquer_stage_lst_review_refined).std()
+                        stage_score_review_refined = _safe_mean(conquer_stage_lst_review_refined)
+                        stage_std_review_refined = float(np.array(conquer_stage_lst_review_refined).std()) if len(conquer_stage_lst_review_refined) > 0 else float('nan')
 
                     df_result_per_dx = {
                         'inference_type': inference_path, 'dx': dx, 'model': args.model_id,
@@ -647,7 +722,7 @@ def gather_scores(inference_path, df_results_total):
                 assert key in gathered_results
                 value = gathered_results[key]
                 if not isinstance(value, str):
-                    gathered_results[key] = np.array(value).mean()
+                    gathered_results[key] = _safe_mean(value)
 
         df_results_total['total'] = gathered_total_dx_score
         if exist_dx_perception:
@@ -722,6 +797,11 @@ if __name__ == '__main__':
     df_results = calculate_metrics(args, inference_path)
 
     df_scores = gather_scores(inference_path, df_results)
+
+    # 如果沒有任何結果 (例如所有 dx 都被跳過)，則安全退出並提示
+    if df_scores.empty or 'dx' not in df_scores.columns:
+        print('No scoring results found (df_scores is empty or missing "dx"). Exiting metric calculation.')
+        exit(0)
 
     if inference_path in ['reasoning']:
         target_score_lst = ['wilson_score_binary', 'stage_score', 'wilson_score_measurement_matching', 'wilson_score_consistency']

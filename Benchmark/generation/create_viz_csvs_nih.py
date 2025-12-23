@@ -244,13 +244,81 @@ def compute_rotation_viz(dicom, cxas_dir, source_row):
             m = 0
             b = xs[0] if len(xs) > 0 else 0
         
-        return {
+        result = {
             'right_end_pnt': source_row.get('medial_end_right_clavicle', None),
             'left_end_pnt': source_row.get('medial_end_left_clavicle', None),
             'target_coords': str(points.tolist()),
             'm': m,
             'b': b
         }
+        
+        # Calculate clavicle slope and intercepts from CXAS masks
+        for side in ['right', 'left']:
+            fname_clavicle = os.path.join(cxas_dir, dicom, f'clavicle {side}.png')
+            if not os.path.exists(fname_clavicle):
+                result[f'{side}_slope'] = 0
+                result[f'{side}_intercept_min'] = 0
+                result[f'{side}_intercept_max'] = 0
+                continue
+            
+            mask_clavicle = cv2.imread(fname_clavicle, 0)
+            if mask_clavicle is None:
+                result[f'{side}_slope'] = 0
+                result[f'{side}_intercept_min'] = 0
+                result[f'{side}_intercept_max'] = 0
+                continue
+            
+            # Find the longest connected component
+            label_im, nb_labels = ndimage.label(mask_clavicle)
+            max_width = 0
+            longest_mask = mask_clavicle
+            for i in range(nb_labels):
+                mask_compare = np.full(np.shape(label_im), i + 1)
+                separate_mask = np.equal(label_im, mask_compare).astype(int)
+                x_indices = separate_mask.sum(axis=0).nonzero()[0]
+                if len(x_indices) == 0:
+                    continue
+                width = abs(x_indices[0] - x_indices[-1]) + 1
+                if width > max_width:
+                    max_width = width
+                    longest_mask = separate_mask
+            
+            # Calculate slope and intercepts
+            y_indices = longest_mask.sum(axis=-1).nonzero()[0]
+            if len(y_indices) < 2:
+                result[f'{side}_slope'] = 0
+                result[f'{side}_intercept_min'] = 0
+                result[f'{side}_intercept_max'] = 0
+                continue
+            
+            ymin = y_indices[0]
+            ymax = y_indices[-1]
+            
+            x_at_ymin = longest_mask[ymin, :].nonzero()[0]
+            x_at_ymax = longest_mask[ymax, :].nonzero()[0]
+            
+            if len(x_at_ymin) == 0 or len(x_at_ymax) == 0:
+                result[f'{side}_slope'] = 0
+                result[f'{side}_intercept_min'] = 0
+                result[f'{side}_intercept_max'] = 0
+                continue
+            
+            x1 = int(np.mean(x_at_ymin))
+            x2 = int(np.mean(x_at_ymax))
+            
+            if x2 != x1:
+                slope = (ymax - ymin) / (x2 - x1)
+            else:
+                slope = 0
+            
+            intercept_min = ymin - slope * x1
+            intercept_max = ymax - slope * x2
+            
+            result[f'{side}_slope'] = float(slope)
+            result[f'{side}_intercept_min'] = float(intercept_min)
+            result[f'{side}_intercept_max'] = float(intercept_max)
+        
+        return result
     except Exception as e:
         print(f"    Error computing viz for {dicom}: {e}")
         return None
@@ -483,11 +551,22 @@ def main():
     parser.add_argument('--nih_csv_dir', type=str, required=True)
     parser.add_argument('--cxas_dir', type=str, default='d:/CXReasonBench/CXAS/cxas',
                        help='Directory containing CXAS segmentation masks')
+    parser.add_argument('--task', type=str, default=None,
+                       help='Process only this specific task (e.g., rotation). If not specified, process all tasks.')
     args = parser.parse_args()
     
     # Load dx_by_dicoms.json
     with open(args.dx_by_dicoms_file, 'r') as f:
         dx_by_dicoms = json.load(f)
+    
+    # Filter to specific task if requested
+    if args.task:
+        if args.task not in dx_by_dicoms:
+            print(f"Error: Task '{args.task}' not found in dx_by_dicoms file")
+            print(f"Available tasks: {', '.join(dx_by_dicoms.keys())}")
+            return
+        dx_by_dicoms = {args.task: dx_by_dicoms[args.task]}
+        print(f"Processing only: {args.task}")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)

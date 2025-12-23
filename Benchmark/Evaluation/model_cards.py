@@ -10,9 +10,30 @@ from google import genai
 import google.genai.types as types
 
 from openai import AzureOpenAI
+import subprocess
+import os
 
 def resize_image_based_on_wider_side(image_path, new_size):
-    img = Image.open(image_path).convert('RGB')
+    # Accept either a PIL Image or a filesystem path. If the path does not exist,
+    # return a neutral placeholder image so evaluation can continue.
+    from PIL import ImageDraw, ImageFont
+    if isinstance(image_path, Image.Image):
+        img = image_path
+    else:
+        if not os.path.exists(image_path):
+            # Create a simple placeholder indicating missing image
+            placeholder = Image.new('RGB', (new_size, new_size), color=(200, 200, 200))
+            try:
+                draw = ImageDraw.Draw(placeholder)
+                font = ImageFont.load_default()
+                text = 'MISSING'
+                w, h = draw.textsize(text, font=font)
+                draw.text(((new_size - w) // 2, (new_size - h) // 2), text, fill=(0, 0, 0), font=font)
+            except Exception:
+                pass
+            return placeholder
+        img = Image.open(image_path).convert('RGB')
+
     original_width, original_height = img.size
 
     if ((original_width >= original_height) and original_width > new_size) \
@@ -109,6 +130,12 @@ def load_model_n_prosessor(args, model_id, model_path):
     elif 'gemini' in model_id:
         model = genai.Client(http_options=types.HttpOptions(api_version="v1"))
         processor = model_id
+
+    elif 'ollama' in model_id:
+        # For Ollama models we only need the model identifier string here.
+        # The inference function will call the Ollama CLI to generate outputs.
+        model = model_id
+        processor = None
 
     elif "gpt-4.1" in model_id:
         model = AzureOpenAI(api_version=args.gpt_api_version,
@@ -355,6 +382,205 @@ def inference_gemini(args, client, model_id, query, img_path_lst, system_message
     chat_history.append([query, img_path_lst, response])
     return response, chat_history
 
+
+def inference_ollama(args, model, processor, query, img_path_lst, system_message, chat_history):
+    import io
+    import base64
+    from mimetypes import guess_type
+
+    # Ensure chat_history is a list (defensive in case callers pass None or wrong type)
+    if not isinstance(chat_history, list):
+        chat_history = []
+
+    def load_image(img_path, img_size):
+        mime_type, _ = guess_type(img_path)
+        if mime_type is None:
+            mime_type = 'application/octet-stream'
+
+        img = resize_image_based_on_wider_side(img_path, img_size)
+        buffered = io.BytesIO()
+        img_format = img.format if img.format else 'PNG'
+        img.save(buffered, format=img_format)
+        base64_encoded_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        return f"data:{mime_type};base64,{base64_encoded_data}"
+
+    # Build a simple textual conversation prompt that includes system message,
+    # chat history, and the current query. Images are embedded as data URLs.
+    parts = []
+    if system_message:
+        parts.append(f"System:\n{system_message}\n---")
+    for (q_hist, imgs_hist, resp_hist) in chat_history:
+        parts.append(f"User:\n{q_hist}")
+        if imgs_hist:
+            for p in imgs_hist:
+                parts.append(f"Image:\n{load_image(p, args.img_size)}")
+        parts.append(f"Assistant:\n{resp_hist}\n---")
+
+    parts.append(f"User:\n{query}")
+    if img_path_lst:
+        for p in img_path_lst:
+            parts.append(f"Image:\n{load_image(p, args.img_size)}")
+
+    prompt = "\n".join(parts)
+
+    # model may be like 'ollama:my-model' or just 'my-model'
+    model_name = model
+    if isinstance(model_name, str) and model_name.startswith('ollama:'):
+        model_name = model_name.split(':', 1)[1]
+
+    use_gpu = getattr(args, 'ollama_use_gpu', False)
+    # Build command without embedding the prompt in argv to avoid ARG_MAX issues.
+    cmd = ["ollama", "generate", model_name]
+    try:
+        # Prefer `run` first because some Ollama CLI installs accept images on `run`
+        # while `generate` may be a text-only subcommand on some versions.
+        candidate_cmds = ["run", "generate", "chat", "eval", "predict"]
+        last_proc = None
+        # Do not enforce a subprocess timeout so Ollama can run to completion
+        timeout_sec = None
+        # ensure debug dir exists for prompt/response/logging
+        try:
+            # Prefer writing debug files under the run's save_base_dir (if provided),
+            # otherwise fall back to repository-root `result_ollama/debug`.
+            debug_dir = None
+            if getattr(args, 'save_base_dir', None):
+                try:
+                    debug_dir = os.path.join(args.save_base_dir, 'debug')
+                    os.makedirs(debug_dir, exist_ok=True)
+                except Exception:
+                    debug_dir = None
+            if debug_dir is None:
+                debug_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'result_ollama', 'debug')
+                os.makedirs(debug_dir, exist_ok=True)
+        except Exception:
+            debug_dir = None
+        # write prompt to debug file (best-effort)
+        try:
+            if debug_dir:
+                import time
+                fn = f"prompt_{model_name}_{int(time.time())}.txt"
+                with open(os.path.join(debug_dir, fn), 'w', encoding='utf-8') as _f:
+                    _f.write(prompt[:200000])
+        except Exception:
+            pass
+
+        for subcmd in candidate_cmds:
+            # Try with and without --gpu flag depending on request
+            tries = []
+            base = ["ollama", subcmd, model_name]
+            # Do not attempt the `--gpu` flag here to avoid CLI incompatibilities.
+            tries.append(base)
+
+            for cmd_try in tries:
+                try:
+                    # Run without an enforced timeout so generation can complete.
+                    if timeout_sec is None:
+                        if getattr(args, 'ollama_debug', False):
+                            print(f"[OLLAMA DEBUG] Running: {' '.join(cmd_try)[:200]} (no-timeout)")
+                        proc = subprocess.run(cmd_try, input=prompt, capture_output=True, text=True, check=False)
+                    else:
+                        if getattr(args, 'ollama_debug', False):
+                            print(f"[OLLAMA DEBUG] Running: {' '.join(cmd_try)[:200]} (timeout={timeout_sec}s)")
+                        proc = subprocess.run(cmd_try, input=prompt, capture_output=True, text=True, check=False, timeout=timeout_sec)
+                except subprocess.TimeoutExpired as te:
+                    # write debug timeout file
+                    try:
+                        if debug_dir:
+                            import time
+                            ofn = f"timeout_{model_name}_{int(time.time())}.txt"
+                            with open(os.path.join(debug_dir, ofn), 'w', encoding='utf-8') as _f:
+                                _f.write(str(te))
+                    except Exception:
+                        pass
+                    last_proc = None
+                    resp_text = f"[OLLAMA_ERROR_TIMEOUT] command={' '.join(cmd_try)} timeout={timeout_sec}s"
+                    # on timeout, break both loops and return
+                    break
+                except FileNotFoundError:
+                    last_proc = None
+                    resp_text = "[OLLAMA_ERROR] ollama command not found"
+                    break
+                except Exception as e:
+                    last_proc = None
+                    resp_text = f"[OLLAMA_ERROR] {e}"
+                    break
+
+                last_proc = proc
+                stdout_text = proc.stdout.strip() if proc.stdout else ''
+                stderr_text = proc.stderr.strip() if proc.stderr else ''
+
+                # write response and stderr to debug files
+                try:
+                    if debug_dir:
+                        import time
+                        ts = int(time.time())
+                        if stdout_text:
+                            ofn = f"response_{model_name}_{ts}.txt"
+                            with open(os.path.join(debug_dir, ofn), 'w', encoding='utf-8') as _f:
+                                _f.write(stdout_text[:200000])
+                        if stderr_text:
+                            ofn = f"stderr_{model_name}_{ts}.txt"
+                            with open(os.path.join(debug_dir, ofn), 'w', encoding='utf-8') as _f:
+                                _f.write(stderr_text[:200000])
+                except Exception:
+                    pass
+
+                if proc.returncode == 0 and stdout_text:
+                    resp_text = stdout_text
+                    break
+
+                # If CLI reports unknown command, try next candidate variant
+                if stderr_text and "unknown command" in stderr_text.lower():
+                    continue
+
+                # otherwise use this error
+                err = stderr_text if stderr_text else stdout_text
+                resp_text = f"[OLLAMA_ERROR] returncode={proc.returncode} stderr={err}"
+                break
+            else:
+                # inner tries loop didn't break; try next subcmd
+                continue
+            # If we broke out due to timeout or successful response, stop trying further subcmds
+            break
+
+        else:
+            # no successful command executed at all
+            if last_proc is not None:
+                err = last_proc.stderr.strip() if last_proc.stderr else last_proc.stdout.strip()
+                resp_text = f"[OLLAMA_ERROR] returncode={last_proc.returncode} stderr={err}"
+            else:
+                # likely FileNotFoundError handled above
+                resp_text = resp_text if 'resp_text' in locals() else "[OLLAMA_ERROR] ollama command not found"
+    except Exception as e:
+        resp_text = f"[OLLAMA_ERROR] {e}"
+
+    chat_history.append([query, img_path_lst, resp_text])
+    # Detect common Ollama responses that indicate the model did not accept/process images
+    nonvision_signals = [
+        "provided an image",
+        "image instead of a text",
+        "not able to process image",
+        "can't process images",
+        "cannot process images",
+    ]
+    try:
+        resp_lower = resp_text.lower() if isinstance(resp_text, str) else ''
+        if any(sig in resp_lower for sig in nonvision_signals):
+            # write a short debug marker file to help users diagnose non-vision model
+            try:
+                if debug_dir:
+                    import time
+                    ofn = f"ollama_nonvision_{model_name}_{int(time.time())}.txt"
+                    with open(os.path.join(debug_dir, ofn), 'w', encoding='utf-8') as _f:
+                        _f.write(resp_text[:200000])
+            except Exception:
+                pass
+            resp_text = f"[OLLAMA_NON_VISION] " + (resp_text if isinstance(resp_text, str) else str(resp_text))
+    except Exception:
+        pass
+
+    return resp_text, chat_history
+
 def inference_gpt(args, client, model_id, query, img_path_lst, system_message, chat_history):
     import io
     import base64
@@ -423,6 +649,7 @@ def inference_vllms(model_id):
         'healthgpt': inference_healthgpt,
         'medgemma': inference_hf,
         'radvlm': inference_hf,
+        'ollama': inference_ollama,
     }
 
     for keyword, func in model_map.items():

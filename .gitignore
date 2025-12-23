@@ -3,3 +3,5 @@ dataset/
 nih_cxr14/
 nih-cxr14_viz/
 output_nih/
+result_ollama/
+__pycache__/
